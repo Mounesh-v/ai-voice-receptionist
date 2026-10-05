@@ -44,13 +44,3 @@ cd frontend
 npm install
 npm run dev
 ```
-
-### Ai repsonse fine tune model
-| Library | Purpose |
-|---|---|
-| `transformers` | Loads Qwen and generates text |
-| `datasets` | Loads and prepares training examples |
-| `trl` | Provides supervised fine-tuning tools |
-| `peft` | Configures LoRA adapters |
-| `bitsandbytes` | Enables 4-bit quantization for QLoRA |
-| `accelerate` | Helps manage model execution and training |

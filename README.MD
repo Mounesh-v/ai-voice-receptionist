@@ -7,7 +7,8 @@ An AI-powered voice receptionist for hospitals that handles common patient enqui
 - Frontend: Next.js
 - Backend: FastAPI (Python)
 - Database: MongoDB
-- AI: Speech-to-Text, LLM, Text-to-Speech
+- Cache / Sessions: Redis
+- AI: Speech-to-Text (Deepgram/Whisper), LLM, Text-to-Speech
 
 ## Project Setup
 
@@ -44,3 +45,14 @@ cd frontend
 npm install
 npm run dev
 ```
+
+## Authentication & RBAC Module
+
+For full documentation on user registration, login, Redis session management, and Role-Based Access Control (RBAC), see [AUTHENTICATION.md](backend/AUTHENTICATION.md).
+
+Run the automated test suite:
+```bash
+cd backend
+python test_auth.py
+```
+

@@ -2,10 +2,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.voice import router as voice_router
-from api.chat import router as chat_router
-from api.tts import router as tts_router
 from api.auth import router as auth_router
 from api.admin import router as admin_router
+from api.appointments import router as appointments_router
+from api.customers import router as customers_router
 from database.redis import close_redis
 
 app = FastAPI(
@@ -29,10 +29,6 @@ app.include_router(
     voice_router,
     prefix="/api"
 )
-<<<<<<< HEAD
-app.include_router(chat_router, prefix="/api")
-app.include_router(tts_router, prefix="/api")
-=======
 
 # Authentication router (Auth, Sessions, RBAC)
 app.include_router(
@@ -46,12 +42,15 @@ app.include_router(
     prefix="/api"
 )
 
+# Appointment and customer management modules
+app.include_router(appointments_router, prefix="/api")
+app.include_router(customers_router, prefix="/api")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     await close_redis()
 
->>>>>>> origin/auth-rbac
 
 @app.get("/")
 def home():

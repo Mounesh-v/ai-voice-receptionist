@@ -1,12 +1,3 @@
-fastapi==0.141.1
-uvicorn==0.53.0
-pydantic==2.13.5
-python-dotenv==1.2.3
-websockets==17.1
-deepgram-sdk==7.12.0
-langchain-groq==1.1.3
-langchain-core==1.6.6
-faster-whisper==1.2.1
 fastapi>=0.115.0
 uvicorn>=0.30.0
 python-dotenv>=1.0.0

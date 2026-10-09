@@ -27,6 +27,9 @@ python -m venv venv
 ```
 
 - Activate the virtual environment and install dependencies:
+```bash 
+.\venv\Scripts\Activate.ps1
+```
 
 ```bash
 pip install -r requirements.txt

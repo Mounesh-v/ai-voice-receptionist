@@ -2,6 +2,7 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 
 from config import GROQ_API_KEY, GROQ_MODEL
+from services.rag import retrieve_business_context
 
 
 SYSTEM_PROMPT = """
@@ -120,9 +121,36 @@ prompt = ChatPromptTemplate.from_messages([
 chain = prompt | llm
 
 
-async def generate_response(transcript: str) -> str:
+async def generate_response(
+    transcript: str,
+    business_id: str | None = None,
+) -> str:
+    context = ""
+
+    if business_id:
+        context = await retrieve_business_context(
+            question=transcript,
+            business_id=business_id,
+        )
+
+    if context:
+        human_message = (
+            f"Caller question:\n{transcript}\n\n"
+            f"Retrieved business information:\n{context}"
+        )
+    elif business_id:
+        human_message = (
+            f"Caller question:\n{transcript}\n\n"
+            "No relevant information was found in this "
+            "business's indexed documents. For business-specific "
+            "questions, explain politely that you cannot confirm "
+            "the information. Do not guess."
+        )
+    else:
+        human_message = transcript
+
     result = await chain.ainvoke({
-        "transcript": transcript
+        "transcript": human_message,
     })
 
     return result.content

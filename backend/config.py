@@ -30,15 +30,11 @@ SESSION_COOKIE_SAMESITE = os.getenv("SESSION_COOKIE_SAMESITE", "lax")
 GEMINI_API_KEY= os.getenv("GEMINI_API_KEY","")
 
 
-QDRANT_URL = os.getenv("QDRANT_URL")
-QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_URL = os.getenv("QDRANT_URL", "").strip()
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY", "").strip()
 QDRANT_COLLECTION_NAME = os.getenv(
     "QDRANT_COLLECTION_NAME",
-    "business_documents",
-)
+    os.getenv("QDRANT_COLLECTION", "business_documents"),
+).strip()
 
-if not QDRANT_URL:
-    raise RuntimeError("QDRANT_URL is missing from .env")
-
-if not QDRANT_API_KEY:
-    raise RuntimeError("QDRANT_API_KEY is missing from .env")
+QDRANT_ENABLED = bool(QDRANT_URL and QDRANT_API_KEY)

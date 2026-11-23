@@ -1,6 +1,8 @@
 "use client";
 
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import { useAuth } from "./AuthProvider";
 
 const VOICE_WS_URL =
   process.env.NEXT_PUBLIC_VOICE_WS_URL || null;
@@ -26,6 +28,8 @@ function getVoiceWsUrl() {
 }
 
 export default function VoiceRecorder() {
+  const { user, logout } = useAuth();
+  const router = useRouter();
   const [isSessionActive, setIsSessionActive] = useState(false);
   const [connectionStatus, setConnectionStatus] = useState("Disconnected");
   const [error, setError] = useState("");
@@ -395,6 +399,12 @@ export default function VoiceRecorder() {
     nextAudioTimeRef.current = 0;
   }
 
+  async function handleLogout() {
+    endSession();
+    await logout();
+    router.replace("/login");
+  }
+
   function endSession() {
     cleanup();
 
@@ -446,8 +456,25 @@ export default function VoiceRecorder() {
           <h1 className="text-2xl font-semibold text-white">AI Receptionist</h1>
 
           <p className="mt-2 text-sm text-slate-400">
-            How can we help you today?
+            How can we help you today
+            {user?.name ? `, ${user.name.split(" ")[0]}` : ""}?
           </p>
+        </div>
+
+        <div className="mt-5 flex items-center justify-between rounded-2xl border border-slate-800 bg-slate-800/50 px-4 py-3">
+          <div className="min-w-0">
+            <p className="truncate text-sm font-medium text-white">
+              {user?.name || "Signed in"}
+            </p>
+            <p className="truncate text-xs text-slate-400">{user?.email}</p>
+          </div>
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="rounded-xl border border-slate-700 px-3 py-1.5 text-xs font-medium text-slate-300 transition hover:border-red-500/40 hover:text-red-300"
+          >
+            Log out
+          </button>
         </div>
 
         {/* USER TRANSCRIPT */}

@@ -14,4 +14,9 @@ langchain-core>=1.0.0
 pymupdf>=1.28.2
 langchain-text-splitters>=1.1.3
 google-genai
+deepgram-sdk
+faster-whisper
+qdrant-client>=1.12.0
+python-multipart
 chromadb
+tzdata

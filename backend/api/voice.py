@@ -3,9 +3,19 @@ import contextlib
 import json
 import time
 
+import uuid
+from services.appointment_agent import (
+    process_appointment_message,
+    get_appointment_state,
+    delete_appointment_state,
+)
+
 import websockets
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from config import RAG_DEFAULT_BUSINESS_ID
+
+from database.redis import get_session
+from config import SESSION_COOKIE_NAME
 
 from config import DEEPGRAM_API_KEY
 from services.chat import generate_response
@@ -51,8 +61,63 @@ def parse_flux_message(message: str) -> tuple[str, str]:
     return event, transcript
 
 
+def is_appointment_request(transcript: str) -> bool:
+    appointment_keywords = [
+        "book an appointment",
+        "book appointment",
+        "schedule an appointment",
+        "schedule appointment",
+        "make an appointment",
+        "want an appointment",
+        "need an appointment",
+        "see a doctor",
+        "consult a doctor",
+        # Cancellation requests
+        "cancel appointment",
+        "cancel my appointment",
+        "cancel the appointment",
+        "cancel booking",
+        "cancel my booking",
+        "want to cancel",
+        "need to cancel",
+        "i would like to cancel",
+        # Rescheduling requests
+        "reschedule appointment",
+        "reschedule my appointment",
+        "change my appointment",
+        "change my booking",
+        "postpone my appointment",
+        "reschedule my booking",
+        "i want to reschedule",
+        "i need to reschedule",
+        "i would like to reschedule",
+        "i'd like to reschedule",
+        "change appointment date",
+        "change appointment time",
+        "change my appointment date",
+        "change my appointment time",
+        "move my appointment",
+        "change my booking date",
+    ]
+    message = transcript.lower()
+    return any(
+        keyword in message
+        for keyword in appointment_keywords
+    )
+
+
 @router.websocket("/voice")
 async def voice(websocket: WebSocket):
+    # Authenticate before accepting the connection.
+    current_user = await authenticate_websocket(websocket)
+    if not current_user:
+        await websocket.close(code=1008, reason="Authentication required")
+        return
+    conversation_id = str(uuid.uuid4())
+    print(f"Appointment conversation ID: {conversation_id}")
+    print(
+        f"Authenticated voice user: {current_user['user_id']}"
+    )
     speaking = asyncio.Event()
     current_turn_task = None
 
@@ -269,12 +334,95 @@ async def voice(websocket: WebSocket):
                     # ---------------------------------------------
                     # GROQ
                     # ---------------------------------------------
+                    existing_appointment = await get_appointment_state(
+                        conversation_id
+                    )
+                    active_stages = [
+                        "collecting_details",
+                        "ready_for_availability",
+                        "awaiting_doctor_selection",
+                        "awaiting_time_selection",
+                        "awaiting_confirmation",
+                        "awaiting_appointment_selection",
+                        "awaiting_cancel_confirmation",
+                        "awaiting_reschedule_selection",
+                        "awaiting_reschedule_date",
+                        "awaiting_reschedule_time_selection",
+                        "awaiting_reschedule_confirmation",
+                    ]
+                    appointment_active = (
+                        existing_appointment is not None
+                        and existing_appointment.stage in active_stages
+                    )
 
-                    if not RAG_DEFAULT_BUSINESS_ID:
-                        await send_json({"type": "fallback","message": "The receptionist is not fully configured yet."})
-                        return
+                    if (
+                        is_appointment_request(transcript)
+                        or appointment_active
+                    ):
+                        appointment_state, extracted = (
+                            await process_appointment_message(
+                                transcript=transcript,
+                                conversation_id=conversation_id,
+                                user_id=current_user["user_id"],
+                                customer_name=current_user["name"],
+                                customer_email=current_user["email"],
+                            )
+                        )
 
-                    answer = await generate_response(transcript,business_id=RAG_DEFAULT_BUSINESS_ID,)
+                        # Use the appointment agent's clarification when available.
+                        if extracted.clarification_needed:
+                            answer = extracted.clarification_needed
+                        elif appointment_state.stage == "collecting_details":
+                            if not appointment_state.service and not appointment_state.appointment_date:
+                                answer = (
+                                    "Which department would you like to consult, "
+                                    "and on which date would you like the appointment?"
+                                )
+                            elif not appointment_state.service:
+                                answer = (
+                                    "Which department would you like to consult?"
+                                )
+                            else:
+                                answer = (
+                                    "On which date would you like the appointment?"
+                                )
+                        elif appointment_state.stage == "awaiting_confirmation":
+                            if extracted.confirmation is True:
+                                answer = (
+                                    "Thank you. I have received your confirmation, "
+                                    "but the appointment booking functionality is "
+                                    "not connected yet. Your appointment has not "
+                                    "been booked."
+                                )
+                            elif extracted.confirmation is False:
+                                answer = (
+                                    "No problem. I haven't booked the appointment. "
+                                    "Would you like to choose a different time?"
+                                )
+                            else:
+                                answer = (
+                                    "Would you like me to confirm this appointment?"
+                                )
+                        elif appointment_state.stage == "cancelled":
+                            answer = "Your appointment has been cancelled successfully."
+                        elif appointment_state.stage == "rescheduled":
+                            answer = "Your appointment has been successfully rescheduled."
+                        else:
+                            answer = (
+                                "I'm processing your appointment request. "
+                                "Could you please provide the requested details?"
+                            )
+                    else:
+                        # Normal hospital questions continue through RAG.
+                        if not RAG_DEFAULT_BUSINESS_ID:
+                            answer = (
+                                "The receptionist is not fully configured yet."
+                            )
+                        else:
+                            answer = await generate_response(
+                                transcript,
+                                business_id=RAG_DEFAULT_BUSINESS_ID,
+                            )
 
                     await send_json({
                         "type": "ai_response",
@@ -462,3 +610,25 @@ async def voice(websocket: WebSocket):
                     ),
                 })
             )
+
+async def authenticate_websocket(
+    websocket: WebSocket
+):
+    # Read the HttpOnly session cookie.
+    session_id = websocket.cookies.get(SESSION_COOKIE_NAME)
+
+    if not session_id:
+        return None
+
+    # Validate the session using Redis.
+    session_data = await get_session(session_id)
+
+    if not session_data:
+        return None
+
+    return {
+        "user_id": session_data.get("user_id"),
+        "name": session_data.get("name"),
+        "email": session_data.get("email"),
+        "role": session_data.get("role", "user"),
+    }

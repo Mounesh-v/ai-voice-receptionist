@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
+from services.appointment_tools import get_doctor_availability
 
 from database.mongodb import get_db, get_users_collection
 from middleware.auth import (
@@ -181,6 +182,35 @@ def find_appointment_or_404(
     return doc
 
 
+def get_scheduled_appointments(user_id: str):
+    """
+    Retrieve upcoming scheduled appointments
+    belonging to a specific patient.
+    """
+    appointments, _ = collections()
+    now = iso(
+        datetime.now(timezone.utc)
+    )
+    docs = (
+        appointments
+        .find({
+            "user_id": user_id,
+            "status": "scheduled",
+            "appointment_start": {
+                "$gte": now
+            }
+        })
+        .sort(
+            "appointment_start",
+            1
+        )
+    )
+    return [
+        public_appointment(doc)
+        for doc in docs
+    ]
+
+
 # ============================================================
 # AUTHORIZATION
 # ============================================================
@@ -236,117 +266,102 @@ def availability(
         require_authenticated_user
     ),
 ):
-    """
-    Return available 30-minute slots
-    between 09:00 and 17:00.
-    """
-
-    # Validate timezone offset
-    match = re.fullmatch(
-        r"([+-])(\d{2}):(\d{2})",
-        timezone_offset
+    return get_doctor_availability(
+        doctor_id=doctor_id,
+        appointment_date=appointment_date,
+        timezone_offset=timezone_offset
     )
-
-    if not match:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "timezone_offset must look like +05:30"
-            )
-        )
-
-    sign, hh, mm = match.groups()
-
-    hours = int(hh)
-    minutes = int(mm)
-
-    if (
-        hours > 14
-        or minutes > 59
-        or (
-            hours == 14
-            and minutes != 0
-        )
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid timezone offset"
-        )
-
-    # Create timezone
-    offset = timedelta(
-        hours=hours,
-        minutes=minutes
-    )
-
-    if sign == "-":
-        offset = -offset
-
-    local_tz = timezone(offset)
-
-    # Hospital working hours
-    local_start = datetime.combine(
-        appointment_date,
-        time(9, 0),
-        tzinfo=local_tz
-    )
-
-    local_end = datetime.combine(
-        appointment_date,
-        time(17, 0),
-        tzinfo=local_tz
-    )
-
-    appointments, slots_collection = collections()
-
-    slots = []
-
-    now = datetime.now(timezone.utc)
-
-    cursor = local_start
-
-    while (
-        cursor + timedelta(minutes=SLOT_MINUTES)
-        <= local_end
-    ):
-        start = cursor.astimezone(
-            timezone.utc
-        )
-
-        # Don't show past slots
-        if start > now:
-
-            reserved = slots_collection.find_one(
-                {
-                    "_id": make_slot_id(
-                        doctor_id,
-                        start
-                    )
-                }
-            )
-
-            slots.append(
-                {
-                    "start": iso(start),
-                    "available": reserved is None
-                }
-            )
-
-        cursor += timedelta(
-            minutes=SLOT_MINUTES
-        )
-
-    return {
-        "doctor_id": doctor_id,
-        "date": appointment_date.isoformat(),
-        "timezone_offset": timezone_offset,
-        "slots": slots
-    }
 
 
 # ============================================================
 # BOOK APPOINTMENT
 # ============================================================
+
+def create_appointment_record(
+    payload: AppointmentCreate,
+    user_id: str,
+    customer_name: str,
+    customer_email: str,
+):
+    """Create an appointment and reserve its time slot."""
+
+    # 1. Validate appointment time
+    start = as_utc(payload.appointment_start)
+
+    # 2. Get MongoDB collections
+    appointments, slots_collection = collections()
+
+    # 3. Verify authenticated user exists
+    users = get_users_collection()
+    user_doc = (
+        users.find_one(
+            {"_id": ObjectId(user_id)}
+        )
+        if (
+            users is not None
+            and ObjectId.is_valid(user_id)
+        )
+        else None
+    )
+
+    if not user_doc:
+        raise HTTPException(
+            status_code=401,
+            detail="Authenticated account was not found"
+        )
+
+    # 4. Generate unique doctor/time slot
+    slot_key = make_slot_id(payload.doctor_id, start)
+
+    # 5. Reserve appointment slot
+    try:
+        slots_collection.insert_one(
+            {
+                "_id": slot_key,
+                "doctor_id": payload.doctor_id,
+                "appointment_start": iso(start)
+            }
+        )
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="This doctor is already booked at that time"
+        )
+
+    # 6. Generate appointment ID
+    appointment_id = str(uuid4())
+
+    # 7. Create appointment document
+    doc = {
+        "appointment_id": appointment_id,
+        "user_id": user_id,
+        "customer_name": customer_name,
+        "customer_email": customer_email,
+        "doctor_id": payload.doctor_id,
+        "service": payload.service,
+        "reason": payload.reason,
+        "appointment_start": iso(start),
+        "appointment_end": iso(
+            start + timedelta(minutes=SLOT_MINUTES)
+        ),
+        "status": "scheduled",
+        "created_at": iso(datetime.now(timezone.utc)),
+        "updated_at": None,
+    }
+
+    # 8. Save appointment
+    try:
+        appointments.insert_one(doc)
+    except Exception:
+        slots_collection.delete_one({"_id": slot_key})
+        raise HTTPException(
+            status_code=500,
+            detail="Could not save appointment; please retry"
+        )
+
+    # 9. Return appointment
+    return public_appointment(doc)
+
 
 @router.post(
     "",
@@ -359,162 +374,15 @@ def book_appointment(
     ),
 ):
     """
-    Book an appointment for the currently
-    authenticated customer.
+    Swagger/API endpoint.
+    Uses the shared booking function.
     """
-
-    # --------------------------------------------------------
-    # 1. Validate appointment time
-    # --------------------------------------------------------
-
-    start = as_utc(
-        payload.appointment_start
+    return create_appointment_record(
+        payload=payload,
+        user_id=current_user.user_id,
+        customer_name=current_user.name,
+        customer_email=current_user.email
     )
-
-    # --------------------------------------------------------
-    # 2. Get MongoDB collections
-    # --------------------------------------------------------
-
-    appointments, slots_collection = collections()
-
-    # --------------------------------------------------------
-    # 3. Verify authenticated user exists
-    # --------------------------------------------------------
-
-    users = get_users_collection()
-
-    user_doc = (
-        users.find_one(
-            {
-                "_id": ObjectId(
-                    current_user.user_id
-                )
-            }
-        )
-        if (
-            users is not None
-            and ObjectId.is_valid(
-                current_user.user_id
-            )
-        )
-        else None
-    )
-
-    if not user_doc:
-        raise HTTPException(
-            status_code=401,
-            detail="Authenticated account was not found"
-        )
-
-    # --------------------------------------------------------
-    # 4. Generate unique doctor/time slot
-    # --------------------------------------------------------
-
-    slot_key = make_slot_id(
-        payload.doctor_id,
-        start
-    )
-
-    # --------------------------------------------------------
-    # 5. Reserve appointment slot
-    # --------------------------------------------------------
-
-    try:
-
-        slots_collection.insert_one(
-            {
-                "_id": slot_key,
-                "doctor_id": payload.doctor_id,
-                "appointment_start": iso(start)
-            }
-        )
-
-    except DuplicateKeyError:
-
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                "This doctor is already booked "
-                "at that time"
-            )
-        )
-
-    # --------------------------------------------------------
-    # 6. Generate appointment ID
-    # --------------------------------------------------------
-
-    appointment_id = str(
-        uuid4()
-    )
-
-    # --------------------------------------------------------
-    # 7. Create appointment document
-    # --------------------------------------------------------
-
-    doc = {
-        "appointment_id": appointment_id,
-
-        "user_id": current_user.user_id,
-
-        "customer_name": current_user.name,
-
-        "customer_email": current_user.email,
-
-        "doctor_id": payload.doctor_id,
-
-        "service": payload.service,
-
-        "reason": payload.reason,
-
-        "appointment_start": iso(start),
-
-        "appointment_end": iso(
-            start + timedelta(
-                minutes=SLOT_MINUTES
-            )
-        ),
-
-        "status": "scheduled",
-
-        "created_at": iso(
-            datetime.now(timezone.utc)
-        ),
-
-        "updated_at": None,
-    }
-
-    # --------------------------------------------------------
-    # 8. Save appointment
-    # --------------------------------------------------------
-
-    try:
-
-        appointments.insert_one(doc)
-
-    except Exception:
-
-        # Appointment insertion failed,
-        # so release the reserved slot.
-
-        slots_collection.delete_one(
-            {
-                "_id": slot_key
-            }
-        )
-
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "Could not save appointment; "
-                "please retry"
-            )
-        )
-
-    # --------------------------------------------------------
-    # 9. Return appointment without MongoDB ObjectId
-    # --------------------------------------------------------
-
-    return public_appointment(doc)
 
 
 # ============================================================
@@ -669,38 +537,36 @@ def appointment_status(
 # CANCEL APPOINTMENT
 # ============================================================
 
-@router.patch(
-    "/{appointment_id}/cancel"
-)
-def cancel_appointment(
+def cancel_appointment_record(
     appointment_id: str,
-
-    current_user: AuthenticatedUser = Depends(
-        require_authenticated_user
-    ),
+    user_id: str,
+    role: str
 ):
-    """
-    Cancel a scheduled appointment.
-    """
+    """Shared cancellation function for REST and voice booking."""
 
     appointments, slots_collection = collections()
 
-    # Find appointment
+    # 1. Find appointment
     doc = find_appointment_or_404(
         appointments,
         appointment_id
     )
 
-    # Check owner/admin
-    ensure_owner_or_admin(
-        doc,
-        current_user
-    )
+    # 2. Check owner/admin authorization
+    if (
+        role != "admin"
+        and doc.get("user_id") != user_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "You cannot cancel another customer's "
+                "appointment"
+            )
+        )
 
-    # Only scheduled appointments
-    # can be cancelled
+    # 3. Only scheduled appointments can be cancelled
     if doc.get("status") != "scheduled":
-
         raise HTTPException(
             status_code=409,
             detail=(
@@ -713,7 +579,7 @@ def cancel_appointment(
         datetime.now(timezone.utc)
     )
 
-    # Update appointment
+    # 4. Update appointment
     result = appointments.update_one(
         {
             "appointment_id": appointment_id,
@@ -729,7 +595,6 @@ def cancel_appointment(
     )
 
     if result.modified_count != 1:
-
         raise HTTPException(
             status_code=409,
             detail=(
@@ -738,7 +603,7 @@ def cancel_appointment(
             )
         )
 
-    # Release appointment slot
+    # 5. Release appointment slot
     old_start = datetime.fromisoformat(
         doc["appointment_start"]
     )
@@ -759,64 +624,67 @@ def cancel_appointment(
     }
 
 
-# ============================================================
-# RESCHEDULE APPOINTMENT
-# ============================================================
-
 @router.patch(
-    "/{appointment_id}/reschedule"
+    "/{appointment_id}/cancel"
 )
-def reschedule_appointment(
+def cancel_appointment(
     appointment_id: str,
-
-    payload: RescheduleRequest,
 
     current_user: AuthenticatedUser = Depends(
         require_authenticated_user
     ),
 ):
     """
-    Reschedule an existing appointment.
+    Cancel a scheduled appointment.
     """
-
-    # --------------------------------------------------------
-    # 1. Validate new appointment time
-    # --------------------------------------------------------
-
-    new_start = as_utc(
-        payload.new_start
+    return cancel_appointment_record(
+        appointment_id=appointment_id,
+        user_id=current_user.user_id,
+        role=current_user.role
     )
 
-    # --------------------------------------------------------
-    # 2. Get collections
-    # --------------------------------------------------------
 
+# ============================================================
+# RESCHEDULE APPOINTMENT
+# ============================================================
+
+def reschedule_appointment_record(
+    appointment_id: str,
+    new_start: datetime,
+    user_id: str,
+    role: str
+):
+    """
+    Shared rescheduling function for REST API and voice agent.
+    """
+
+    # 1. Validate new appointment time
+    new_start = as_utc(new_start)
+
+    # 2. Get MongoDB collections
     appointments, slots_collection = collections()
 
-    # --------------------------------------------------------
-    # 3. Find appointment
-    # --------------------------------------------------------
-
+    # 3. Find existing appointment
     doc = find_appointment_or_404(
         appointments,
         appointment_id
     )
 
-    # --------------------------------------------------------
-    # 4. Check owner/admin
-    # --------------------------------------------------------
+    # 4. Check owner/admin authorization
+    if (
+        role != "admin"
+        and doc.get("user_id") != user_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "You cannot reschedule another customer's "
+                "appointment"
+            )
+        )
 
-    ensure_owner_or_admin(
-        doc,
-        current_user
-    )
-
-    # --------------------------------------------------------
-    # 5. Appointment must be scheduled
-    # --------------------------------------------------------
-
+    # 5. Only scheduled appointments can be rescheduled
     if doc.get("status") != "scheduled":
-
         raise HTTPException(
             status_code=409,
             detail=(
@@ -825,142 +693,99 @@ def reschedule_appointment(
             )
         )
 
-    # --------------------------------------------------------
-    # 6. Get old appointment time
-    # --------------------------------------------------------
-
+    # 6. Get the old appointment time
     old_start = datetime.fromisoformat(
         doc["appointment_start"]
-    ).astimezone(
-        timezone.utc
-    )
+    ).astimezone(timezone.utc)
 
-    # --------------------------------------------------------
-    # 7. Prevent same time
-    # --------------------------------------------------------
-
+    # 7. Prevent rescheduling to the same time
     if new_start == old_start:
-
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Choose a different appointment time"
-            )
+            detail="Choose a different appointment time"
         )
 
-    # --------------------------------------------------------
-    # 8. Generate slot keys
-    # --------------------------------------------------------
-
+    # 8. Generate old and new slot keys
     new_key = make_slot_id(
         doc["doctor_id"],
         new_start
     )
-
     old_key = make_slot_id(
         doc["doctor_id"],
         old_start
     )
 
-    # --------------------------------------------------------
-    # 9. Reserve new slot
-    # --------------------------------------------------------
-
+    # 9. Reserve the new slot
     try:
-
         slots_collection.insert_one(
             {
                 "_id": new_key,
                 "doctor_id": doc["doctor_id"],
-                "appointment_start": iso(
-                    new_start
-                )
+                "appointment_start": iso(new_start)
             }
         )
-
     except DuplicateKeyError:
-
         raise HTTPException(
             status_code=409,
-            detail=(
-                "The requested time "
-                "is already booked"
-            )
+            detail="The requested time is already booked"
         )
 
-    # --------------------------------------------------------
-    # 10. Update appointment
-    # --------------------------------------------------------
-
-    now = iso(
-        datetime.now(timezone.utc)
-    )
-
+    # 10. Update the appointment
+    now = iso(datetime.now(timezone.utc))
     result = appointments.update_one(
         {
             "appointment_id": appointment_id,
             "status": "scheduled",
-            "appointment_start": doc[
-                "appointment_start"
-            ]
+            "appointment_start": doc["appointment_start"]
         },
         {
             "$set": {
-                "appointment_start": iso(
-                    new_start
-                ),
-
+                "appointment_start": iso(new_start),
                 "appointment_end": iso(
-                    new_start
-                    + timedelta(
-                        minutes=SLOT_MINUTES
-                    )
+                    new_start + timedelta(minutes=SLOT_MINUTES)
                 ),
-
                 "updated_at": now
             }
         }
     )
 
-    # --------------------------------------------------------
-    # 11. If update failed, release new slot
-    # --------------------------------------------------------
-
+    # 11. Release the new slot if the update failed
     if result.modified_count != 1:
-
-        slots_collection.delete_one(
-            {
-                "_id": new_key
-            }
-        )
-
+        slots_collection.delete_one({"_id": new_key})
         raise HTTPException(
             status_code=409,
-            detail=(
-                "Appointment changed; "
-                "refresh and try again"
-            )
+            detail="Appointment changed; refresh and try again"
         )
 
-    # --------------------------------------------------------
-    # 12. Release old slot
-    # --------------------------------------------------------
+    # 12. Release the old slot
+    slots_collection.delete_one({"_id": old_key})
 
-    slots_collection.delete_one(
-        {
-            "_id": old_key
-        }
-    )
-
-    # --------------------------------------------------------
-    # 13. Return response
-    # --------------------------------------------------------
-
+    # 13. Return the rescheduled appointment
     return {
         "message": "Appointment rescheduled",
         "appointment_id": appointment_id,
-        "appointment_start": iso(
-            new_start
-        ),
+        "appointment_start": iso(new_start),
         "status": "scheduled"
     }
+
+
+@router.patch(
+    "/{appointment_id}/reschedule"
+)
+def reschedule_appointment(
+    appointment_id: str,
+    payload: RescheduleRequest,
+    current_user: AuthenticatedUser = Depends(
+        require_authenticated_user
+    ),
+):
+    """
+    Reschedule an existing appointment.
+    """
+
+    return reschedule_appointment_record(
+        appointment_id=appointment_id,
+        new_start=payload.new_start,
+        user_id=current_user.user_id,
+        role=current_user.role
+    )

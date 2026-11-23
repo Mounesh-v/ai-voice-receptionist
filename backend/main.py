@@ -6,6 +6,7 @@ from api.chat import router as chat_router
 from api.tts import router as tts_router
 from api.auth import router as auth_router
 from api.admin import router as admin_router
+from api.doctors import router as doctors_router
 from api.appointments import router as appointments_router
 from api.customers import router as customers_router
 from database.redis import close_redis
@@ -22,7 +23,8 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000"
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -59,6 +61,12 @@ app.include_router(
     documents_router,
     prefix="/api",
     tags=["Documents"],
+)
+
+#Getting Doctor ID
+app.include_router(
+    doctors_router,
+    prefix="/api"
 )
 
 @app.on_event("shutdown")

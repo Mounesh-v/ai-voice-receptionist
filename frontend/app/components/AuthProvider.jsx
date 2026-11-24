@@ -25,6 +25,9 @@ export default function AuthProvider({ children }) {
 
       if (!response.ok) {
         setUser(null);
+        if (typeof window !== "undefined") {
+          localStorage.removeItem("session_id");
+        }
         return null;
       }
 
@@ -44,14 +47,16 @@ export default function AuthProvider({ children }) {
       try {
         const response = await apiRequest("/api/auth/me", { method: "GET" });
 
-        if (cancelled) {
-          return;
-        }
+        if (cancelled) return;
 
         if (response.ok) {
-          setUser(await response.json());
+          const profile = await response.json();
+          setUser(profile);
         } else {
           setUser(null);
+          if (typeof window !== "undefined") {
+            localStorage.removeItem("session_id");
+          }
         }
       } catch {
         if (!cancelled) {
@@ -80,6 +85,9 @@ export default function AuthProvider({ children }) {
     }
 
     const data = await response.json();
+    if (data.session_id && typeof window !== "undefined") {
+      localStorage.setItem("session_id", data.session_id);
+    }
     setUser(data.user);
     return data.user;
   }, []);
@@ -101,6 +109,9 @@ export default function AuthProvider({ children }) {
     try {
       await apiRequest("/api/auth/logout", { method: "POST" });
     } finally {
+      if (typeof window !== "undefined") {
+        localStorage.removeItem("session_id");
+      }
       setUser(null);
     }
   }, []);

@@ -6,7 +6,16 @@ from config import GEMINI_API_KEY
 MODEL_NAME = "gemini-embedding-2"
 EMBEDDING_DIMENSIONS = 768
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+client = None
+
+
+def get_genai_client():
+    global client
+    if client is None:
+        if not GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY is not configured in .env")
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    return client
 
 
 def generate_embeddings(
@@ -15,10 +24,11 @@ def generate_embeddings(
     if not texts:
         return []
 
+    genai_client = get_genai_client()
     vectors = []
 
     for text in texts:
-        result = client.models.embed_content(
+        result = genai_client.models.embed_content(
             model=MODEL_NAME,
             contents=types.Content(
                 parts=[

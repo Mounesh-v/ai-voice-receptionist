@@ -32,19 +32,27 @@ export async function parseApiError(response) {
       return data.message;
     }
   } catch {
-    // Fall through to the generic message.
+    // Fall through to generic message
   }
 
   return "Request failed. Please try again.";
 }
 
 export async function apiRequest(path, options = {}) {
+  let token = null;
+  if (typeof window !== "undefined") {
+    token = localStorage.getItem("session_id");
+  }
+
+  const headers = {
+    "Content-Type": "application/json",
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(options.headers || {}),
+  };
+
   const response = await fetch(`${getApiBaseUrl()}${path}`, {
     credentials: "include",
-    headers: {
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
+    headers,
     ...options,
   });
 

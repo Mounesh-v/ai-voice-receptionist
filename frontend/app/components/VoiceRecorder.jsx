@@ -3,9 +3,9 @@
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { useAuth } from "./AuthProvider";
+import { startPcmStream } from "./micPcmStream";
 
-const VOICE_WS_URL =
-  process.env.NEXT_PUBLIC_VOICE_WS_URL || null;
+const VOICE_WS_URL = process.env.NEXT_PUBLIC_VOICE_WS_URL || null;
 
 /*
  * Follow the page's hostname so the socket works on
@@ -18,14 +18,32 @@ function getVoiceWsUrl() {
   }
 
   if (typeof window !== "undefined") {
-    const protocol =
-      window.location.protocol === "https:" ? "wss:" : "ws:";
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
 
     return `${protocol}//${window.location.hostname}:8000/api/voice`;
   }
 
   return "ws://localhost:8000/api/voice";
 }
+
+// Languages the assistant can both understand (Sarvam STT)
+// and speak (Sarvam TTS). Codes are BCP-47.
+const LANGUAGES = [
+  { code: "en-IN", label: "English" },
+  { code: "hi-IN", label: "हिन्दी (Hindi)" },
+  { code: "bn-IN", label: "বাংলা (Bengali)" },
+  { code: "ta-IN", label: "தமிழ் (Tamil)" },
+  { code: "te-IN", label: "తెలుగు (Telugu)" },
+  { code: "kn-IN", label: "ಕನ್ನಡ (Kannada)" },
+  { code: "ml-IN", label: "മലയാളം (Malayalam)" },
+  { code: "mr-IN", label: "मराठी (Marathi)" },
+  { code: "gu-IN", label: "ગુજરાતી (Gujarati)" },
+  { code: "pa-IN", label: "ਪੰਜਾਬੀ (Punjabi)" },
+  { code: "od-IN", label: "ଓଡ଼ିଆ (Odia)" },
+];
+
+const DEFAULT_LANGUAGE = "en-IN";
+const LANGUAGE_STORAGE_KEY = "voiceLanguage";
 
 export default function VoiceRecorder() {
   const { user, logout } = useAuth();
@@ -36,11 +54,15 @@ export default function VoiceRecorder() {
   const [transcript, setTranscript] = useState("");
   const [aiResponse, setAiResponse] = useState("");
 
-  // null = listening, "thinking" = transcript sent to Groq,
+  // Chosen before the conversation starts; locked while it runs.
+  const [language, setLanguage] = useState(DEFAULT_LANGUAGE);
+
+  // null = listening, "thinking" = transcript sent to the LLM,
   // "speaking" = TTS audio is playing
   const [assistantState, setAssistantState] = useState(null);
 
-  const mediaRecorderRef = useRef(null);
+  // Stops the 16 kHz PCM mic stream (AudioWorklet) started for STT.
+  const stopMicRef = useRef(null);
   const streamRef = useRef(null);
   const socketRef = useRef(null);
 
@@ -49,44 +71,72 @@ export default function VoiceRecorder() {
   const nextAudioTimeRef = useRef(0);
   const sourcesRef = useRef([]);
 
-  async function playPCMChunk(arrayBuffer) {
-    try {
-      if (!audioContextRef.current) {
-        audioContextRef.current = new AudioContext({
-          sampleRate: 24000,
-        });
-      }
+  // The backend streams raw linear16; a chunk can end mid-sample.
+  const carryByteRef = useRef(null);
+  // Decoded audio held back briefly so network jitter
+  // does not cause gaps/crackle between chunks.
+  const pendingAudioRef = useRef([]);
+  const playbackStartedRef = useRef(false);
+  const prefillTimerRef = useRef(null);
 
-      const audioContext = audioContextRef.current;
+  // Must match SAMPLE_RATE in backend/services/text_to_speech.py
+  const TTS_SAMPLE_RATE = 24000;
+  const PREFILL_SECONDS = 0.1;
+  const PREFILL_TIMEOUT_MS = 150;
+  const START_LEAD_SECONDS = 0.05;
 
-      if (audioContext.state === "suspended") {
-        await audioContext.resume();
-      }
+  /*
+   * Create (and unlock) the playback context. Called from the
+   * Start button click so browsers that require a user gesture
+   * (Safari / iOS) allow audio later, and so the first AI reply
+   * does not pay context-creation latency.
+   *
+   * Uses the hardware's native rate. Forcing a 24 kHz context makes
+   * the OS resample on output, which sounds muffled on many devices.
+   * The 24 kHz PCM is declared on the AudioBuffer instead, so Web
+   * Audio resamples it with its high-quality resampler.
+   */
+  function ensureAudioContext() {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
 
-      /*
-       * Deepgram TTS:
-       *
-       * encoding = linear16
-       * sample_rate = 24000
-       *
-       * Audio is raw signed 16-bit PCM, not a WAV file.
-       */
+    const audioContext = audioContextRef.current;
 
-      const usableBytes = arrayBuffer.byteLength - (arrayBuffer.byteLength % 2);
+    if (audioContext.state === "suspended") {
+      audioContext.resume().catch(() => {});
+    }
 
-      if (usableBytes === 0) {
-        return;
-      }
+    return audioContext;
+  }
 
-      const int16 = new Int16Array(arrayBuffer.slice(0, usableBytes));
+  function flushPendingAudio() {
+    if (prefillTimerRef.current) {
+      clearTimeout(prefillTimerRef.current);
+      prefillTimerRef.current = null;
+    }
 
-      const float32 = new Float32Array(int16.length);
+    const audioContext = audioContextRef.current;
+    const pending = pendingAudioRef.current;
 
-      for (let i = 0; i < int16.length; i++) {
-        float32[i] = int16[i] / 32768;
-      }
+    if (!audioContext || pending.length === 0) {
+      return;
+    }
 
-      const audioBuffer = audioContext.createBuffer(1, float32.length, 24000);
+    if (!playbackStartedRef.current) {
+      playbackStartedRef.current = true;
+
+      nextAudioTimeRef.current = audioContext.currentTime + START_LEAD_SECONDS;
+    }
+
+    pendingAudioRef.current = [];
+
+    for (const float32 of pending) {
+      const audioBuffer = audioContext.createBuffer(
+        1,
+        float32.length,
+        TTS_SAMPLE_RATE,
+      );
 
       audioBuffer.copyToChannel(float32, 0);
 
@@ -104,12 +154,6 @@ export default function VoiceRecorder() {
         );
       };
 
-      /*
-       * Schedule chunks one after another.
-       * Chunks stream in, so playback starts as soon
-       * as the first one arrives.
-       */
-
       const currentTime = audioContext.currentTime;
 
       if (nextAudioTimeRef.current < currentTime) {
@@ -119,14 +163,91 @@ export default function VoiceRecorder() {
       source.start(nextAudioTimeRef.current);
 
       nextAudioTimeRef.current += audioBuffer.duration;
+    }
+  }
+
+  async function playPCMChunk(arrayBuffer) {
+    try {
+      const audioContext = ensureAudioContext();
+
+      if (audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+
+      /*
+       * Sarvam TTS (configured in the backend):
+       *
+       * output_audio_codec = linear16
+       * speech_sample_rate = 24000
+       *
+       * Audio is raw signed 16-bit PCM, not a WAV file.
+       */
+
+      let data = new Uint8Array(arrayBuffer);
+
+      // Rejoin a byte left over from an odd-length chunk so
+      // 16-bit samples never shift across chunk boundaries.
+      if (carryByteRef.current !== null) {
+        const rejoined = new Uint8Array(data.length + 1);
+
+        rejoined[0] = carryByteRef.current;
+        rejoined.set(data, 1);
+
+        data = rejoined;
+      }
+
+      const usableBytes = data.byteLength - (data.byteLength % 2);
+
+      if (usableBytes === data.byteLength) {
+        carryByteRef.current = null;
+      } else if (data.byteLength > 0) {
+        carryByteRef.current = data[usableBytes];
+      }
+
+      if (usableBytes === 0) {
+        return;
+      }
+
+      const int16 = new Int16Array(data.slice(0, usableBytes).buffer);
+
+      const float32 = new Float32Array(int16.length);
+
+      for (let i = 0; i < int16.length; i++) {
+        float32[i] = int16[i] / 32768;
+      }
+
+      pendingAudioRef.current.push(float32);
+
+      if (playbackStartedRef.current) {
+        flushPendingAudio();
+        return;
+      }
+
+      const pendingSeconds = pendingAudioRef.current.reduce(
+        (total, chunk) => total + chunk.length / TTS_SAMPLE_RATE,
+        0,
+      );
+
+      if (pendingSeconds >= PREFILL_SECONDS) {
+        flushPendingAudio();
+        return;
+      }
+
+      // Never strand a short reply in the prebuffer.
+      if (!prefillTimerRef.current) {
+        prefillTimerRef.current = setTimeout(
+          flushPendingAudio,
+          PREFILL_TIMEOUT_MS,
+        );
+      }
     } catch (err) {
       console.error("Audio playback error:", err);
     }
   }
 
   // Stops everything already queued/playing.
-  // Backend can trigger this with { "type": "clear_audio" }
-  // once barge-in is enabled.
+  // Backend triggers this with { "type": "interrupt" } (or "clear_audio")
+  // when the caller barges in.
   function stopPlayback() {
     for (const source of sourcesRef.current) {
       try {
@@ -140,6 +261,15 @@ export default function VoiceRecorder() {
 
     nextAudioTimeRef.current = 0;
 
+    if (prefillTimerRef.current) {
+      clearTimeout(prefillTimerRef.current);
+      prefillTimerRef.current = null;
+    }
+
+    pendingAudioRef.current = [];
+    playbackStartedRef.current = false;
+    carryByteRef.current = null;
+
     // Immediately return the UI to listening state.
     setAssistantState(null);
   }
@@ -147,6 +277,7 @@ export default function VoiceRecorder() {
   // Distinguish "backend down" from other WebSocket failures.
   async function probeBackend(wsUrl) {
     const healthUrl = wsUrl
+      .split("?")[0]
       .replace(/^ws/, "http")
       .replace(/\/api\/voice$/, "/health");
 
@@ -169,6 +300,13 @@ export default function VoiceRecorder() {
     );
   }
 
+  // True while `socket` is still the live session socket.
+  function isCurrentSocket(socket) {
+    return (
+      socketRef.current === socket && socket.readyState === WebSocket.OPEN
+    );
+  }
+
   async function startSession() {
     try {
       setError("");
@@ -177,9 +315,14 @@ export default function VoiceRecorder() {
       setAssistantState(null);
       setConnectionStatus("Connecting...");
 
+      // Runs inside the click handler, so the browser allows audio.
+      ensureAudioContext();
+
       // 1. Connect to FastAPI WebSocket
 
-      const socket = new WebSocket(getVoiceWsUrl());
+      const socket = new WebSocket(
+        `${getVoiceWsUrl()}?lang=${encodeURIComponent(language)}`,
+      );
 
       socket.binaryType = "arraybuffer";
 
@@ -201,23 +344,31 @@ export default function VoiceRecorder() {
             },
           });
 
+          // The user may have ended the session while the
+          // permission prompt was open.
+          if (!isCurrentSocket(socket)) {
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+          }
+
           streamRef.current = stream;
 
-          // 3. Recorder streaming continuously
+          // 3. Stream 16 kHz PCM16 frames (what Sarvam STT expects)
 
-          const mediaRecorder = new MediaRecorder(stream);
-
-          mediaRecorderRef.current = mediaRecorder;
-
-          mediaRecorder.ondataavailable = (event) => {
-            if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
-              socket.send(event.data);
+          const stopMic = await startPcmStream(stream, (pcm) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(pcm);
             }
-          };
+          });
 
-          // 4. 250ms chunks, never stopped until END
+          // Session ended while the audio worklet was loading.
+          if (!isCurrentSocket(socket)) {
+            await stopMic();
+            stream.getTracks().forEach((track) => track.stop());
+            return;
+          }
 
-          mediaRecorder.start(250);
+          stopMicRef.current = stopMic;
 
           setIsSessionActive(true);
 
@@ -225,7 +376,14 @@ export default function VoiceRecorder() {
         } catch (err) {
           console.error("Microphone error:", err);
 
-          setError("Could not access microphone.");
+          const denied =
+            err?.name === "NotAllowedError" || err?.name === "NotFoundError";
+
+          setError(
+            denied
+              ? "Could not access microphone."
+              : "Could not start audio capture.",
+          );
 
           cleanup();
 
@@ -240,7 +398,7 @@ export default function VoiceRecorder() {
          * JSON:
          *   transcript / ai_thinking /
          *   ai_response / ai_done /
-         *   clear_audio
+         *   interrupt / clear_audio
          *
          * Binary:
          *   TTS PCM audio chunk
@@ -252,13 +410,13 @@ export default function VoiceRecorder() {
 
             console.log("Backend message:", data);
 
-            // User transcript (partial + final)
+            // User transcript
 
             if (data.type === "transcript" && data.transcript) {
               setTranscript(data.transcript);
             }
 
-            // Transcript reached Groq
+            // Transcript reached the LLM
 
             if (data.type === "ai_thinking") {
               setAssistantState("thinking");
@@ -278,12 +436,10 @@ export default function VoiceRecorder() {
               setAssistantState(null);
             }
 
-            // Backend reported a failure (e.g. Deepgram down)
+            // Backend reported a failure (e.g. a speech service is down)
 
             if (data.type === "error") {
-              setError(
-                data.message || "Voice service error.",
-              );
+              setError(data.message || "Voice service error.");
 
               setConnectionStatus("Error");
             }
@@ -344,7 +500,7 @@ export default function VoiceRecorder() {
       socket.onclose = () => {
         console.log("WebSocket disconnected");
 
-        // Stop mic + recorder so nothing keeps running
+        // Stop mic + audio capture so nothing keeps running
         // against a dead socket.
         cleanup();
 
@@ -364,13 +520,11 @@ export default function VoiceRecorder() {
   }
 
   function cleanup() {
-    const mediaRecorder = mediaRecorderRef.current;
-
-    if (mediaRecorder && mediaRecorder.state !== "inactive") {
-      mediaRecorder.stop();
+    // Stop the PCM capture (worklet + its AudioContext).
+    if (stopMicRef.current) {
+      stopMicRef.current();
+      stopMicRef.current = null;
     }
-
-    mediaRecorderRef.current = null;
 
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => {
@@ -417,6 +571,29 @@ export default function VoiceRecorder() {
     console.log("Conversation ended");
   }
 
+  // Restore the language the caller picked last time.
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(LANGUAGE_STORAGE_KEY);
+
+      if (saved && LANGUAGES.some((item) => item.code === saved)) {
+        setLanguage(saved);
+      }
+    } catch {
+      // Storage unavailable (private mode) - keep the default.
+    }
+  }, []);
+
+  function handleLanguageChange(code) {
+    setLanguage(code);
+
+    try {
+      window.localStorage.setItem(LANGUAGE_STORAGE_KEY, code);
+    } catch {
+      // Ignore storage errors.
+    }
+  }
+
   // Release mic / socket / audio if component unmounts
   useEffect(() => {
     return () => {
@@ -426,6 +603,10 @@ export default function VoiceRecorder() {
   }, []);
 
   const assistantBusy = assistantState !== null;
+
+  // The language can only change before a conversation starts.
+  const languageLocked =
+    isSessionActive || connectionStatus === "Connecting...";
 
   const buttonClass = !isSessionActive
     ? "bg-blue-600 text-white shadow-lg shadow-blue-600/30 hover:bg-blue-700"
@@ -475,6 +656,37 @@ export default function VoiceRecorder() {
           >
             Log out
           </button>
+        </div>
+
+        {/* LANGUAGE */}
+
+        <div className="mt-5">
+          <label
+            htmlFor="voice-language"
+            className="block text-xs font-medium text-slate-400"
+          >
+            Conversation language
+          </label>
+
+          <select
+            id="voice-language"
+            value={language}
+            onChange={(event) => handleLanguageChange(event.target.value)}
+            disabled={languageLocked}
+            className="mt-2 w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2.5 text-sm text-white outline-none transition focus:border-blue-500 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {LANGUAGES.map((item) => (
+              <option key={item.code} value={item.code}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+
+          <p className="mt-1 text-xs text-slate-500">
+            {languageLocked
+              ? "End the conversation to change the language."
+              : "Choose before you start. The assistant listens and replies in this language."}
+          </p>
         </div>
 
         {/* USER TRANSCRIPT */}

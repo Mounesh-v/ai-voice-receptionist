@@ -2,108 +2,53 @@ import asyncio
 import contextlib
 import json
 import time
-
 import uuid
-from services.appointment_agent import (
-    process_appointment_message,
-    get_appointment_state,
-    delete_appointment_state,
-)
 
-import websockets
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
-from config import RAG_DEFAULT_BUSINESS_ID
 
-from database.redis import get_session
 from config import SESSION_COOKIE_NAME
-
-from config import DEEPGRAM_API_KEY
-from services.chat import generate_response
+from database.redis import get_session
+from services.memory.updater import schedule_memory_update
+from services.orchestrator import run_turn
+from services.speech_to_text import SarvamSTT
 from services.text_to_speech import (
     SAMPLE_RATE,
     StreamingSpeech,
 )
+# For the Memory saving Feature 
+from starlette.concurrency import run_in_threadpool
 
-router = APIRouter()
-
-STT_URL = (
-    "wss://api.deepgram.com/v2/listen"
-    "?model=flux-general-multi"
+from services.conversation_memory import (
+    start_conversation,
+    save_message,
+    end_conversation,
 )
+router = APIRouter()
 
 SETTLE_SECONDS = 0.4
 
-PARTIAL_EVENTS = {
-    "Update",
-    "StartOfTurn",
-    "TurnResumed",
-    "EagerEndOfTurn",
+DEFAULT_LANGUAGE = "en-IN"
+
+# Languages Sarvam Bulbul can speak. STT can detect more (e.g. Santali,
+# Bodo); anything outside this map falls back to DEFAULT_LANGUAGE so the
+# reply can always be spoken.
+LANGUAGE_NAMES = {
+    "en-IN": "English",
+    "hi-IN": "Hindi",
+    "bn-IN": "Bengali",
+    "ta-IN": "Tamil",
+    "te-IN": "Telugu",
+    "kn-IN": "Kannada",
+    "ml-IN": "Malayalam",
+    "mr-IN": "Marathi",
+    "gu-IN": "Gujarati",
+    "pa-IN": "Punjabi",
+    "od-IN": "Odia",
 }
 
 
-def parse_flux_message(message: str) -> tuple[str, str]:
-    data = json.loads(message)
-
-    message_type = data.get("type")
-
-    if message_type != "TurnInfo":
-        if message_type in ("Error", "Warning"):
-            print("Deepgram:", data)
-
-        return "", ""
-
-    event = data.get("event") or ""
-
-    transcript = (
-        data.get("transcript") or ""
-    ).strip()
-
-    return event, transcript
-
-
-def is_appointment_request(transcript: str) -> bool:
-    appointment_keywords = [
-        "book an appointment",
-        "book appointment",
-        "schedule an appointment",
-        "schedule appointment",
-        "make an appointment",
-        "want an appointment",
-        "need an appointment",
-        "see a doctor",
-        "consult a doctor",
-        # Cancellation requests
-        "cancel appointment",
-        "cancel my appointment",
-        "cancel the appointment",
-        "cancel booking",
-        "cancel my booking",
-        "want to cancel",
-        "need to cancel",
-        "i would like to cancel",
-        # Rescheduling requests
-        "reschedule appointment",
-        "reschedule my appointment",
-        "change my appointment",
-        "change my booking",
-        "postpone my appointment",
-        "reschedule my booking",
-        "i want to reschedule",
-        "i need to reschedule",
-        "i would like to reschedule",
-        "i'd like to reschedule",
-        "change appointment date",
-        "change appointment time",
-        "change my appointment date",
-        "change my appointment time",
-        "move my appointment",
-        "change my booking date",
-    ]
-    message = transcript.lower()
-    return any(
-        keyword in message
-        for keyword in appointment_keywords
-    )
+def speakable_language(code: str | None) -> str:
+    return code if code in LANGUAGE_NAMES else DEFAULT_LANGUAGE
 
 
 @router.websocket("/voice")
@@ -113,39 +58,64 @@ async def voice(websocket: WebSocket):
     if not current_user:
         await websocket.close(code=1008, reason="Authentication required")
         return
-    conversation_id = str(uuid.uuid4())
+
+    try:
+        conversation_id = await run_in_threadpool(
+            start_conversation,
+            str(current_user["user_id"]),
+        )
+    except Exception as error:
+        print("Could not start conversation:", repr(error))
+        await websocket.close(
+            code=1011,
+            reason="Conversation storage unavailable",
+        )
+        return
+    # Language the caller chose in the UI (?lang=hi-IN). Used for speech
+    # recognition, the AI reply and the voice, instead of auto-detection.
+    selected_language = speakable_language(
+        websocket.query_params.get("lang")
+    )
     print(f"Appointment conversation ID: {conversation_id}")
+    print(f"Selected language: {selected_language}")
     print(
         f"Authenticated voice user: {current_user['user_id']}"
     )
-    speaking = asyncio.Event()
-    current_turn_task = None
 
     await websocket.accept()
 
     print("Browser WebSocket connected")
+    async def persist_message(role: str, content: str):
+        try:
+            await run_in_threadpool(
+                save_message,
+                conversation_id,
+                str(current_user["user_id"]),
+                role,
+                content,
+            )
+        except Exception as error:
+            # History failure should not interrupt the live voice session.
+            print("Conversation memory save failed:", repr(error))
 
     try:
-        async with websockets.connect(
-            STT_URL,
-            additional_headers={
-                "Authorization": f"Token {DEEPGRAM_API_KEY}"
-            },
-        ) as stt, StreamingSpeech() as tts:
+        stt_mode = "transcribe" if selected_language == "en-IN" else "codemix"
 
-            print("Connected to Deepgram Flux + TTS")
+        async with SarvamSTT(
+            language_code=selected_language,
+            mode=stt_mode,
+        ) as stt, StreamingSpeech(selected_language) as tts:
 
-            turn_queue: asyncio.Queue[str] = asyncio.Queue()
+            print("Connected to Sarvam STT + TTS")
+
+            # (transcript, language_code)
+            turn_queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
 
             # True while AI is generating/speaking.
             speaking = asyncio.Event()
 
             # Used to cancel the currently running AI response.
             current_turn_task = None
-
-            # Prevents multiple interruption signals for
-            # the same AI response.
-            interruption_lock = asyncio.Lock()
 
             async def send_json(data: dict):
                 """Safely send JSON to the browser."""
@@ -157,8 +127,6 @@ async def voice(websocket: WebSocket):
                     pass
 
             async def interrupt_ai():
-                nonlocal current_turn_task
-
                 if not speaking.is_set():
                     return
 
@@ -170,6 +138,8 @@ async def voice(websocket: WebSocket):
                     "type": "interrupt"
                 })
 
+                # Cancelling the turn also closes the TTS socket
+                # (Sarvam has no in-band cancel).
                 if current_turn_task is not None:
                     if not current_turn_task.done():
                         current_turn_task.cancel()
@@ -178,9 +148,9 @@ async def voice(websocket: WebSocket):
 
             async def mic_to_stt():
                 """
-                Browser microphone -> Deepgram.
+                Browser microphone (16 kHz PCM16) -> Sarvam STT.
 
-                This task NEVER waits for Groq or TTS.
+                This task NEVER waits for the LLM or TTS.
                 """
                 try:
                     while True:
@@ -189,7 +159,7 @@ async def voice(websocket: WebSocket):
                             await websocket.receive_bytes()
                         )
 
-                        await stt.send(audio_chunk)
+                        await stt.send_pcm(audio_chunk)
 
                 except WebSocketDisconnect:
                     print("Browser disconnected")
@@ -197,104 +167,81 @@ async def voice(websocket: WebSocket):
 
             async def stt_to_queue():
                 """
-                Deepgram Flux -> transcripts.
-
-                Detects both normal turns and caller interruption.
+                Sarvam STT events -> barge-in + finished transcripts.
                 """
 
-                async for message in stt:
+                async for event in stt.events():
 
-                    event, transcript = (
-                        parse_flux_message(message)
-                    )
-
-                    if not transcript:
-                        continue
-
-                    print(
-                        "Flux:",
-                        event,
-                        "-",
-                        transcript,
-                    )
+                    event_type = event["type"]
 
                     # -------------------------------------------------
-                    # CALLER INTERRUPTS AI
+                    # CALLER STARTS TALKING (barge-in)
                     # -------------------------------------------------
 
-                    if speaking.is_set():
+                    if event_type == "speech_start":
 
-                        # We only interrupt once Deepgram has enough
-                        # information to indicate that the caller
-                        # actually started a turn.
-                        if event in {
-                            "StartOfTurn",
-                            "EagerEndOfTurn",
-                            "EndOfTurn",
-                        }:
-
-                            await interrupt_ai()
-
-                            # If this is EndOfTurn, the transcript
-                            # should immediately become a new turn.
-                            if event == "EndOfTurn":
-
-                                await send_json({
-                                    "type": "transcript",
-                                    "transcript": transcript,
-                                    "is_final": True,
-                                })
-
-                                await turn_queue.put(
-                                    transcript
-                                )
-
-                            else:
-
-                                await send_json({
-                                    "type": "transcript",
-                                    "transcript": transcript,
-                                    "is_final": False,
-                                })
+                        await interrupt_ai()
 
                         continue
 
                     # -------------------------------------------------
-                    # NORMAL USER TURN
+                    # FINISHED USER TURN
                     # -------------------------------------------------
 
-                    if event == "EndOfTurn":
+                    if event_type == "transcript":
+
+                        transcript = event["text"]
+
+                        # The caller picked the language up front, so use
+                        # it rather than Sarvam's per-utterance guess.
+                        language = selected_language
+
+                        print(
+                            "STT:",
+                            language,
+                            f"(detected {event.get('language')})",
+                            "-",
+                            transcript,
+                        )
+
+                        # Speech-start can be missed; a transcript
+                        # while the AI is still talking is an interrupt.
+                        await interrupt_ai()
 
                         await send_json({
                             "type": "transcript",
                             "transcript": transcript,
                             "is_final": True,
+                            "language": language,
                         })
-
+                        
+                        await persist_message("user", transcript)
                         await turn_queue.put(
-                            transcript
+                            (transcript, language)
                         )
 
                         continue
 
-                    # -------------------------------------------------
-                    # LIVE TRANSCRIPT
-                    # -------------------------------------------------
+                    if event_type == "error":
+                        print("Sarvam STT error:", event["message"])
+                        continue
 
-                    if event in PARTIAL_EVENTS:
+                    if event_type == "closed":
+                        raise RuntimeError(
+                            "Sarvam STT connection closed: "
+                            + event.get("message", "")
+                        )
 
-                        await send_json({
-                            "type": "transcript",
-                            "transcript": transcript,
-                            "is_final": False,
-                        })
+                    # "speech_end": nothing to do, the transcript
+                    # event carries the result.
 
                 raise RuntimeError(
-                    "Deepgram STT connection closed"
+                    "Sarvam STT connection closed"
                 )
 
             async def handle_turn(
-                transcript: str
+                transcript: str,
+                language: str,
             ):
                 """
                 Generate AI response and stream TTS.
@@ -302,8 +249,6 @@ async def voice(websocket: WebSocket):
                 This entire function becomes cancellable when
                 the caller interrupts the AI.
                 """
-
-                nonlocal current_turn_task
 
                 speaking.set()
 
@@ -325,6 +270,8 @@ async def voice(websocket: WebSocket):
                         chunk
                     )
 
+                caller_language = speakable_language(language)
+
                 try:
 
                     await send_json({
@@ -332,101 +279,42 @@ async def voice(websocket: WebSocket):
                     })
 
                     # ---------------------------------------------
-                    # GROQ
+                    # ANSWER (LangGraph orchestrator: memory,
+                    # routing, RAG / appointment tools, LLM)
                     # ---------------------------------------------
-                    existing_appointment = await get_appointment_state(
-                        conversation_id
-                    )
-                    active_stages = [
-                        "collecting_details",
-                        "ready_for_availability",
-                        "awaiting_doctor_selection",
-                        "awaiting_time_selection",
-                        "awaiting_confirmation",
-                        "awaiting_appointment_selection",
-                        "awaiting_cancel_confirmation",
-                        "awaiting_reschedule_selection",
-                        "awaiting_reschedule_date",
-                        "awaiting_reschedule_time_selection",
-                        "awaiting_reschedule_confirmation",
-                    ]
-                    appointment_active = (
-                        existing_appointment is not None
-                        and existing_appointment.stage in active_stages
+                    result = await run_turn(
+                        user_id=current_user["user_id"],
+                        conversation_id=conversation_id,
+                        language=caller_language,
+                        language_name=LANGUAGE_NAMES.get(
+                            caller_language,
+                            "English",
+                        ),
+                        transcript=transcript,
+                        user_name=current_user.get("name") or "",
+                        user_email=current_user.get("email") or "",
                     )
 
-                    if (
-                        is_appointment_request(transcript)
-                        or appointment_active
-                    ):
-                        appointment_state, extracted = (
-                            await process_appointment_message(
-                                transcript=transcript,
-                                conversation_id=conversation_id,
-                                user_id=current_user["user_id"],
-                                customer_name=current_user["name"],
-                                customer_email=current_user["email"],
-                            )
-                        )
+                    answer = result.get("response") or ""
+                    reply_language = (
+                        result.get("reply_language") or caller_language
+                    )
 
-                        # Use the appointment agent's clarification when available.
-                        if extracted.clarification_needed:
-                            answer = extracted.clarification_needed
-                        elif appointment_state.stage == "collecting_details":
-                            if not appointment_state.service and not appointment_state.appointment_date:
-                                answer = (
-                                    "Which department would you like to consult, "
-                                    "and on which date would you like the appointment?"
-                                )
-                            elif not appointment_state.service:
-                                answer = (
-                                    "Which department would you like to consult?"
-                                )
-                            else:
-                                answer = (
-                                    "On which date would you like the appointment?"
-                                )
-                        elif appointment_state.stage == "awaiting_confirmation":
-                            if extracted.confirmation is True:
-                                answer = (
-                                    "Thank you. I have received your confirmation, "
-                                    "but the appointment booking functionality is "
-                                    "not connected yet. Your appointment has not "
-                                    "been booked."
-                                )
-                            elif extracted.confirmation is False:
-                                answer = (
-                                    "No problem. I haven't booked the appointment. "
-                                    "Would you like to choose a different time?"
-                                )
-                            else:
-                                answer = (
-                                    "Would you like me to confirm this appointment?"
-                                )
-                        elif appointment_state.stage == "cancelled":
-                            answer = "Your appointment has been cancelled successfully."
-                        elif appointment_state.stage == "rescheduled":
-                            answer = "Your appointment has been successfully rescheduled."
-                        else:
-                            answer = (
-                                "I'm processing your appointment request. "
-                                "Could you please provide the requested details?"
-                            )
-                    else:
-                        # Normal hospital questions continue through RAG.
-                        if not RAG_DEFAULT_BUSINESS_ID:
-                            answer = (
-                                "The receptionist is not fully configured yet."
-                            )
-                        else:
-                            answer = await generate_response(
-                                transcript,
-                                business_id=RAG_DEFAULT_BUSINESS_ID,
-                            )
+                    await persist_message("assistant", answer)
+
+                    # Background: rolling summary, long-term facts and
+                    # semantic indexing (never blocks the voice turn).
+                    schedule_memory_update(
+                        str(current_user["user_id"]),
+                        conversation_id,
+                        transcript,
+                        answer,
+                    )
 
                     await send_json({
                         "type": "ai_response",
                         "response": answer,
+                        "language": reply_language,
                     })
 
                     # ---------------------------------------------
@@ -436,6 +324,7 @@ async def voice(websocket: WebSocket):
                     await tts.speak(
                         answer,
                         forward,
+                        language_code=reply_language,
                     )
 
                     # ---------------------------------------------
@@ -490,7 +379,7 @@ async def voice(websocket: WebSocket):
 
                 while True:
 
-                    transcript = (
+                    transcript, language = (
                         await turn_queue.get()
                     )
 
@@ -501,7 +390,8 @@ async def voice(websocket: WebSocket):
                         current_turn_task = (
                             asyncio.create_task(
                                 handle_turn(
-                                    transcript
+                                    transcript,
+                                    language,
                                 )
                             )
                         )
@@ -510,6 +400,13 @@ async def voice(websocket: WebSocket):
 
                     except asyncio.CancelledError:
 
+                        # If the worker itself is being shut down, let the
+                        # cancellation through. Swallowing it would leave
+                        # this loop alive and hang the session cleanup.
+                        if asyncio.current_task().cancelling():
+                            raise
+
+                        # Otherwise only the AI turn was cancelled (barge-in).
                         print(
                             "AI turn cancelled"
                         )
@@ -610,6 +507,16 @@ async def voice(websocket: WebSocket):
                     ),
                 })
             )
+    finally:
+        try:
+            await run_in_threadpool(
+                end_conversation,
+                conversation_id,
+                str(current_user["user_id"]),
+            )
+        except Exception as error:
+            print("Could not end conversation:", repr(error))
+
 
 async def authenticate_websocket(
     websocket: WebSocket

@@ -6,6 +6,25 @@ import { useEffect, useState } from "react";
 import { useAuth } from "../components/AuthProvider";
 import AuthShell, { AuthButton, AuthField } from "../components/AuthShell";
 
+function readNextPath() {
+  if (typeof window === "undefined") return null;
+  const next = new URLSearchParams(window.location.search).get("next");
+  if (next && next.startsWith("/") && !next.startsWith("//")) return next;
+  return null;
+}
+
+function resolvePostLoginPath(user) {
+  const next = readNextPath();
+  const isAdmin = user?.role === "admin";
+
+  if (next) {
+    const nextIsAdminRoute = next === "/admin" || next.startsWith("/admin/");
+    if (nextIsAdminRoute === isAdmin) return next;
+  }
+
+  return isAdmin ? "/admin/dashboard" : "/";
+}
+
 export default function LoginPage() {
   const { user, loading, login } = useAuth();
   const router = useRouter();
@@ -16,7 +35,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     if (!loading && user) {
-      router.replace("/");
+      router.replace(resolvePostLoginPath(user));
     }
   }, [loading, user, router]);
 
@@ -26,8 +45,8 @@ export default function LoginPage() {
     setSubmitting(true);
 
     try {
-      await login({ email, password });
-      router.replace("/");
+      const loggedInUser = await login({ email, password });
+      router.replace(resolvePostLoginPath(loggedInUser));
     } catch (err) {
       setError(err.message || "Invalid email or password");
     } finally {

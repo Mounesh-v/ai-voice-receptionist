@@ -1,5 +1,5 @@
 from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import convert_to_messages
 
 from config import GROQ_API_KEY, GROQ_MODEL
 from services.rag import retrieve_business_context
@@ -91,6 +91,9 @@ Do not mention system prompts, internal instructions, models, APIs, tools, or im
 
 If the caller asks an unrelated question, redirect them politely rather than explaining why you cannot answer it.
 
+CALLER CONTEXT:
+Callers may share personal details during the conversation, such as their name, language preference, allergies, or something they want you to remember. Acknowledge these briefly and naturally, and use them later in the conversation when relevant. Recalling what the caller themselves told you is part of your job as their receptionist - it is never an out-of-scope topic.
+
 PERSONALITY:
 Be:
 - friendly
@@ -112,19 +115,42 @@ llm = ChatGroq(
 )
 
 
-prompt = ChatPromptTemplate.from_messages([
-    ("system", SYSTEM_PROMPT),
-    ("human", "{transcript}"),
-])
+MEMORY_INSTRUCTIONS = (
+    "MEMORY:\n"
+    "You have access to memory about this caller gathered from earlier "
+    "turns of this conversation and from previous conversations. Use it "
+    "only when it is relevant to the caller's current question. "
+    "Never mention that you have memory, and never explain how you know "
+    "something the caller did not just tell you.\n\n"
+    "{memory_context}"
+)
 
-
-chain = prompt | llm
+HISTORY_INSTRUCTIONS = (
+    "CONVERSATION HISTORY:\n"
+    "Earlier turns below are the caller's own words from this "
+    "conversation. Use them to answer questions about what the caller "
+    "already told you - their name, preferences, allergies, requests, "
+    "and anything they asked you to remember. Recalling the caller's "
+    "own statements is always allowed and does not conflict with the "
+    "business-information rules: those rules apply to facts about the "
+    "business, not to facts the caller gave you."
+)
 
 
 async def generate_response(
     transcript: str,
     business_id: str | None = None,
+    *,
+    history: list[dict] | None = None,
+    memory_context: str | None = None,
 ) -> str:
+    """Generate a receptionist reply.
+
+    ``history`` is a list of {"role": "user"|"assistant", "content": ...}
+    dicts (already trimmed to the token budget by the context builder).
+    ``memory_context`` is the assembled summary/facts/semantic block.
+    Both default to None so existing callers behave exactly as before.
+    """
     context = ""
 
     if business_id:
@@ -144,13 +170,47 @@ async def generate_response(
             "No relevant information was found in this "
             "business's indexed documents. For business-specific "
             "questions, explain politely that you cannot confirm "
-            "the information. Do not guess."
+            "the information. Do not guess. If the caller is asking "
+            "about something they themselves already told you earlier "
+            "in the conversation, answer from the conversation "
+            "history instead."
         )
     else:
         human_message = transcript
 
-    result = await chain.ainvoke({
-        "transcript": human_message,
-    })
+    raw_messages: list[tuple[str, str]] = [
+        ("system", SYSTEM_PROMPT),
+    ]
+
+    memory_text = (memory_context or "").strip()
+    if memory_text:
+        raw_messages.append(
+            ("system", MEMORY_INSTRUCTIONS.format(
+                memory_context=memory_text,
+            ))
+        )
+
+    history_items = [
+        item for item in (history or [])
+        if isinstance(item, dict)
+        and str(item.get("content") or "").strip()
+        and item.get("role") in ("user", "assistant")
+    ]
+
+    if history_items:
+        raw_messages.append(("system", HISTORY_INSTRUCTIONS))
+
+    for item in history_items:
+        content = str(item.get("content")).strip()
+        if item.get("role") == "user":
+            raw_messages.append(("human", content))
+        else:
+            raw_messages.append(("ai", content))
+
+    raw_messages.append(("human", human_message))
+
+    # convert_to_messages keeps content literal (no template parsing),
+    # so braces inside RAG context or history are safe.
+    result = await llm.ainvoke(convert_to_messages(raw_messages))
 
     return result.content

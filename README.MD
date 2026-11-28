@@ -1,6 +1,6 @@
 # AI Voice Receptionist
 
-An AI-powered voice receptionist for hospitals and businesses. Handles real-time voice conversations, answers questions using a Retrieval-Augmented Generation (RAG) system built on indexed business documents, and manages patient appointments — all through a continuous, hands-free voice interface.
+An AI-powered voice receptionist for hospitals and businesses. Handles real-time, multilingual voice conversations (English + 10 Indian languages), answers questions using a Retrieval-Augmented Generation (RAG) system built on indexed business documents, and manages patient appointments through a continuous, hands-free voice interface — plus a full patient portal and admin dashboard.
 
 ---
 
@@ -24,28 +24,32 @@ An AI-powered voice receptionist for hospitals and businesses. Handles real-time
 
 ### Purpose
 
-The AI Voice Receptionist replaces a human front-desk receptionist for hospitals and businesses. Callers speak naturally — the system listens continuously, understands context from indexed business documents, and responds with a synthesised voice in real time.
+The AI Voice Receptionist replaces a human front-desk receptionist for hospitals and businesses. Callers speak naturally in their preferred language — the system listens continuously, understands context from indexed business documents, and responds with a synthesised voice in real time.
 
 ### Key Features
 
 | Feature | Description |
 |---|---|
-| **Real-time voice conversation** | Continuous microphone streaming with sub-second response latency |
-| **Barge-in interruption** | Caller can interrupt the AI mid-sentence and it stops immediately |
-| **RAG-powered answers** | Responses grounded in indexed business/hospital PDF documents |
-| **Appointment management** | Book, reschedule, cancel, and view appointments with slot-conflict prevention |
+| **Real-time voice conversation** | Continuous microphone streaming (16 kHz PCM16 via AudioWorklet) with sub-second response latency |
+| **Multilingual voice** | 11 languages: English, Hindi, Bengali, Tamil, Telugu, Kannada, Malayalam, Marathi, Gujarati, Punjabi, Odia |
+| **Barge-in interruption** | Caller can interrupt the AI mid-sentence (Sarvam VAD speech signals) and playback stops immediately |
+| **RAG-powered answers** | Responses grounded in indexed business/hospital PDF documents (Qdrant + Gemini embeddings) |
+| **Voice appointment agent** | LLM tool-calling agent handles book / cancel / reschedule conversations with a stage-based state machine |
+| **Appointment management** | REST endpoints for slot availability, booking, cancellation, rescheduling with slot-conflict prevention |
 | **Customer profiles** | Persistent patient profile storage (phone, address, DOB, emergency contact) |
-| **Authentication & RBAC** | Secure session-based auth with `user` and `admin` roles |
-| **Admin controls** | Admins can view all appointments, list all customers, and create admin accounts |
+| **Conversation history** | Every voice turn persisted to MongoDB (`conversations` + `conversation_messages`) |
+| **Authentication & RBAC** | Session-based auth with `user` and `admin` roles (HttpOnly cookie, Redis-backed) |
+| **Patient portal** | Dashboard, live AI receptionist, booking, appointment history, profile, hospital info |
+| **Admin dashboard** | Admins manage appointments, doctors, patients, knowledge base, reports, and settings |
 | **Document indexing** | Upload PDFs that are chunked, embedded, and stored in a vector database for RAG |
 
 ### Application Responsibilities
 
 | Application | Responsibility |
 |---|---|
-| **Frontend (Next.js)** | Voice UI, WebSocket client, real-time audio capture and playback |
-| **Backend (FastAPI)** | API gateway, voice pipeline orchestration, business logic, auth, RAG |
-| **MongoDB** | Persistent storage for users, appointments, booking slots, and customer profiles |
+| **Frontend (Next.js)** | Patient portal + admin dashboard, WebSocket voice client, audio capture/playback |
+| **Backend (FastAPI)** | API gateway, voice pipeline orchestration, business logic, auth, RAG, appointment agent |
+| **MongoDB** | Persistent storage for users, appointments, slots, profiles, doctors, conversations |
 | **Redis** | Session storage with TTL-based expiry for stateless, scalable auth |
 | **Qdrant** | Vector database for semantic search over indexed business documents |
 
@@ -62,8 +66,8 @@ The AI Voice Receptionist replaces a human front-desk receptionist for hospitals
 | **Language** | Python | 3.11+ recommended |
 | **LLM** | Groq (via LangChain) | `langchain-groq>=1.1.0`, model: `openai/gpt-oss-120b` |
 | **LLM Orchestration** | LangChain Core | `langchain-core>=1.0.0` |
-| **Speech-to-Text** | Deepgram Flux | WebSocket streaming STT (`flux-general-multi` model) |
-| **Text-to-Speech** | Deepgram Aura 2 | WebSocket streaming TTS (`aura-2-asteria-en`, linear16 @ 24kHz) |
+| **Speech-to-Text** | Sarvam AI | `sarvamai` SDK — streaming STT, model `saaras:v4`, 16 kHz, VAD signals for barge-in |
+| **Text-to-Speech** | Sarvam AI | `sarvamai` SDK — model `bulbul:v3`, speaker `shubh`, linear PCM @ 24 kHz |
 | **Embeddings** | Google Gemini | `google-genai`, model: `gemini-embedding-2`, 768 dimensions |
 | **Vector Database** | Qdrant | Cloud or self-hosted, cosine similarity |
 | **Primary Database** | MongoDB | `pymongo[srv]>=4.8.0` |
@@ -76,22 +80,27 @@ The AI Voice Receptionist replaces a human front-desk receptionist for hospitals
 | **WebSockets** | websockets | `>=13.0` |
 | **Config** | python-dotenv | `>=1.0.0` |
 
+> **Note:** `requirements.txt` still carries legacy entries (`deepgram-sdk`, `faster-whisper`, `chromadb`) from the previous voice stack. The live pipeline uses `sarvamai` — install it with `pip install sarvamai` if it is missing from your environment.
+
 ### Frontend
 
 | Category | Technology | Version / Notes |
 |---|---|---|
 | **Framework** | Next.js | `16.3.5` (App Router) |
-| **Language** | JavaScript / JSX | React 19 |
+| **Language** | JavaScript (portal) + TypeScript (admin, `lib/`, `types/`) | React 19 |
 | **UI Library** | React | `19.2.8` |
 | **Styling** | Tailwind CSS | `^4` |
-| **Audio** | Web Audio API | Native browser API — no external audio library |
-| **Transport** | WebSocket (native) | `MediaRecorder` for mic capture |
+| **Icons** | lucide-react | `^1.79.0` |
+| **Charts** | Recharts | `^3.10.1` (admin dashboard) |
+| **Audio capture** | Web Audio API + AudioWorklet | `public/pcm-worklet.js` downsamples mic to 16 kHz PCM16 |
+| **Audio playback** | Web Audio API | Buffer scheduler for 24 kHz TTS chunks |
+| **Transport** | WebSocket (native) | Binary PCM frames + JSON events |
 
 ### External Services
 
 | Service | Purpose | Plan |
 |---|---|---|
-| **Deepgram** | STT + TTS | Pay-as-you-go |
+| **Sarvam AI** | Streaming STT + TTS | Pay-as-you-go |
 | **Groq** | LLM inference (fast) | Free tier / Pay-as-you-go |
 | **Google Gemini** | Text embeddings | Free tier / Pay-as-you-go |
 | **Qdrant Cloud** | Managed vector database | Free tier / Managed |
@@ -103,62 +112,71 @@ The AI Voice Receptionist replaces a human front-desk receptionist for hospitals
 ```mermaid
 flowchart TD
     subgraph Browser["🌐 Browser (Next.js Frontend)"]
-        UI["VoiceRecorder.jsx\nUI + State Management"]
-        MR["MediaRecorder\n250ms audio chunks"]
-        AC["Web AudioContext\nPCM playback scheduler"]
-        UI --> MR
-        UI --> AC
+        UI["AiReceptionistView.jsx\nVoice UI + language picker + state"]
+        AW["AudioWorklet pcm-downsampler\n16 kHz mono PCM16 frames"]
+        PB["Web AudioContext\n24 kHz playback scheduler"]
+        UI --> AW
+        UI --> PB
     end
 
     subgraph Backend["⚙️ FastAPI Backend"]
         direction TB
-        VP["api/voice.py\nWebSocket /api/voice\n[mic_to_stt · stt_to_queue · turn_worker]"]
+        VP["api/voice.py\nWebSocket /api/voice (cookie auth, ?lang=)\n[mic_to_stt · stt_to_queue · turn_worker]"]
         CS["services/chat.py\nLangChain + Groq Chain\nSystem Prompt + RAG injection"]
+        AG["services/appointment_agent.py\nLLM tool-calling agent\nbook / cancel / reschedule"]
         RS["services/rag.py\nRAG retrieval orchestrator"]
         ES["services/embeddings.py\nGemini embed_content()"]
         VS["services/vector_store.py\nQdrant client"]
-        TTS["services/text_to_speech.py\nStreamingSpeech\n(persistent WS)"]
+        STT["services/speech_to_text.py\nSarvamSTT (saaras:v4)\nVAD signals → barge-in"]
+        TTS["services/text_to_speech.py\nStreamingSpeech (bulbul:v3)\nsentence-split streaming"]
+        MEM["services/conversation_memory.py\npersist turns to MongoDB"]
         AUTH["api/auth.py\nRegister · Login · Logout · Me"]
         MW["middleware/auth.py\nSession extraction + RBAC"]
         APPT["api/appointments.py\nSlot availability · Book · Cancel · Reschedule"]
+        DOC["api/doctors.py\nDoctor directory"]
         CUST["api/customers.py\nProfile · History"]
         DOCS["api/documents.py\nPDF extract · chunk · index"]
     end
 
     subgraph Databases["🗄️ Data Layer"]
-        MONGO[("MongoDB\nusers\nappointments\nbooking_slots\ncustomer_profiles")]
+        MONGO[("MongoDB\nusers · appointments\nbooking_slots · customer_profiles\ndoctors · conversations\nconversation_messages")]
         REDIS[("Redis\nsession:<id> → JSON + TTL")]
         QDRANT[("Qdrant\nbusiness_documents\n768-dim cosine vectors")]
     end
 
     subgraph External["☁️ External AI Services"]
-        DG_STT["Deepgram Flux\nwss://api.deepgram.com/v2/listen\nSTT WebSocket"]
-        DG_TTS["Deepgram Aura 2\nTTS WebSocket\naura-2-asteria-en"]
+        SARVAM["Sarvam AI\nSTT saaras:v4 (wss)\nTTS bulbul:v3 (24 kHz)"]
         GROQ["Groq API\nopenai/gpt-oss-120b\ntemp=0.3"]
         GEMINI["Google Gemini\ngemini-embedding-2\n768 dimensions"]
     end
 
-    MR -- "binary audio frames" --> VP
-    VP -- "JSON events + PCM bytes" --> AC
+    AW -- "binary PCM frames (16 kHz)" --> VP
+    VP -- "JSON events + PCM bytes (24 kHz)" --> PB
 
-    VP --> DG_STT
-    DG_STT -- "TurnInfo events + transcripts" --> VP
-    VP --> CS
+    VP --> STT
+    STT --> SARVAM
+    SARVAM -- "transcripts + VAD signals" --> STT
+    STT --> CS
+    STT --> AG
+    VP --> MEM
+    MEM --> MONGO
     CS --> RS
     RS --> ES
     ES --> GEMINI
     RS --> VS
     VS --> QDRANT
     CS --> GROQ
+    AG --> GROQ
     GROQ -- "AI response text" --> CS
     CS --> TTS
-    TTS --> DG_TTS
-    DG_TTS -- "linear16 PCM chunks" --> TTS
+    TTS --> SARVAM
+    SARVAM -- "linear16 PCM chunks" --> TTS
 
     AUTH --> MONGO
     AUTH --> REDIS
     MW --> REDIS
     APPT --> MONGO
+    DOC --> MONGO
     CUST --> MONGO
     DOCS --> ES
     DOCS --> VS
@@ -176,18 +194,22 @@ ai-voice-receptionist/
 ├── backend/                         # FastAPI Python application
 │   ├── main.py                      # App factory, CORS, router registration
 │   ├── config.py                    # Environment variable loading (single source of truth)
-│   ├── requirements.txt             # Python dependencies
+│   ├── requirements.txt             # Python dependencies (includes legacy Deepgram entries)
 │   ├── .env                         # Local secrets (git-ignored)
 │   ├── .env.example                 # Template for required variables
+│   ├── AUTHENTICATION.md            # Auth module documentation
+│   ├── APPOINTMENT_CUSTOMER_MODULE.md # Appointments + customers module documentation
 │   │
 │   ├── api/                         # Route layer — thin HTTP/WS handlers
-│   │   ├── voice.py                 # ★ Core WebSocket voice pipeline
+│   │   ├── voice.py                 # ★ Core WebSocket voice pipeline (Sarvam STT/TTS, barge-in,
+│   │   │                            #   appointment agent, conversation persistence)
 │   │   ├── chat.py                  # POST /api/chat — REST text chat
 │   │   ├── tts.py                   # POST /api/tts — REST text-to-speech → WAV
 │   │   ├── auth.py                  # /api/auth/* — register, login, logout, me
 │   │   ├── admin.py                 # /api/admin/* — RBAC-protected admin ops
 │   │   ├── appointments.py          # /api/appointments/* — full appointment CRUD
 │   │   ├── customers.py             # /api/customers/* — patient profiles & history
+│   │   ├── doctors.py               # /api/doctors/* — doctor directory (create/list/fetch)
 │   │   └── documents.py             # /api/documents/* — PDF ingestion and RAG indexing
 │   │
 │   ├── services/                    # Business logic layer — reusable, testable
@@ -195,12 +217,16 @@ ai-voice-receptionist/
 │   │   ├── rag.py                   # RAG orchestrator: embed question → Qdrant search
 │   │   ├── embeddings.py            # Gemini embedding-2 client (768-dim)
 │   │   ├── vector_store.py          # Qdrant: collection init, upsert, cosine search
-│   │   ├── text_to_speech.py        # StreamingSpeech: persistent Deepgram TTS WebSocket
-│   │   ├── speech_to_text.py        # Faster-Whisper stub (unused — STT via Deepgram)
-│   │   └── security.py              # bcrypt password hashing + secrets session ID
+│   │   ├── speech_to_text.py        # ★ SarvamSTT: streaming STT (saaras:v4, 16 kHz, VAD)
+│   │   ├── text_to_speech.py        # ★ StreamingSpeech: Sarvam TTS (bulbul:v3, 24 kHz)
+│   │   ├── appointment_agent.py     # LLM tool-calling appointment flow (state machine)
+│   │   ├── appointment_tools.py     # find_doctors / check_doctor_availability tools
+│   │   ├── conversation_memory.py   # Persist conversations + messages to MongoDB
+│   │   ├── security.py              # bcrypt password hashing + secrets session ID
+│   │   └── stt/                     # Legacy local STT artifacts (sravaani model cache)
 │   │
 │   ├── database/                    # Database connection singletons
-│   │   ├── mongodb.py               # MongoClient + users collection + email unique index
+│   │   ├── mongodb.py               # MongoClient + users/conversations/messages collections
 │   │   ├── redis.py                 # Async Redis client + session CRUD + FakeRedis fallback
 │   │   └── __init__.py
 │   │
@@ -213,26 +239,63 @@ ai-voice-receptionist/
 │   │   └── __init__.py
 │   │
 │   ├── scripts/
-│   │   └── create_admin.py          # CLI script to seed first admin account
+│   │   ├── create_admin.py          # CLI script to seed first admin account
+│   │   └── seed_doctors.py          # CLI script to seed the doctors collection
 │   │
-│   └── Test/                        # Automated test suite
-│       ├── test_auth.py             # 12-scenario auth + RBAC flow tests
+│   └── Test/                        # Test scripts + audio fixtures
+│       ├── test_auth.py             # Auth + RBAC flow tests
 │       ├── test_db.py               # MongoDB connection tests
 │       ├── test_embeddings.py       # Gemini embedding tests
-│       ├── test_qdrant_connection.py# Qdrant connectivity tests
-│       └── test_rag_chat.py         # End-to-end RAG + chat tests
+│       ├── test_qdrant_connection.py # Qdrant connectivity tests
+│       ├── test_rag_chat.py         # End-to-end RAG + chat tests
+│       ├── test_appointment_agent.py# Appointment agent tests
+│       ├── test_appointment_availability.py / test_availability.py
+│       ├── test_doctor_lookup.py    # Doctor directory tests
+│       └── test_sarvam.py           # Sarvam STT/TTS connectivity tests
 │
-└── frontend/                        # Next.js application
-    ├── package.json                 # Dependencies: Next.js 16, React 19, Tailwind 4
+└── frontend/                        # Next.js application (portal + admin)
+    ├── package.json                 # Next.js 16, React 19, Tailwind 4, lucide-react, recharts
     ├── next.config.mjs
-    ├── postcss.config.mjs
-    ├── jsconfig.json
+    ├── tsconfig.json                # TypeScript (admin dashboard + lib)
+    ├── eslint.config.mjs
+    │
+    ├── public/
+    │   └── pcm-worklet.js           # ★ AudioWorklet: downsample mic → 16 kHz PCM16
+    │
+    ├── lib/
+    │   ├── api.ts                   # API base URL + apiFetch/apiRequest (credentials: include)
+    │   ├── mappers.ts                # Backend → UI model mappers
+    │   └── navigation.ts             # Admin sidebar navigation
+    ├── data/                        # Demo/static datasets for admin pages
+    ├── types/                       # Shared TS types (appointment, doctor, reports, ...)
+    │
     └── app/
-        ├── layout.js                # Root layout — Geist fonts, full-height body
-        ├── page.js                  # Home page — renders <VoiceRecorder />
-        ├── globals.css              # Tailwind base + custom animations
+        ├── layout.js                 # Root layout — Geist fonts, full-height body
+        ├── page.js                   # Patient portal — tabs (dashboard / AI receptionist / booking / ...)
+        ├── globals.css               # Tailwind base + custom animations
+        ├── login/page.js             # Login screen
+        ├── signup/page.js            # Registration screen
+        ├── admin/                    # Admin dashboard (TS)
+        │   ├── layout.tsx            # Admin shell (sidebar + header)
+        │   ├── page.tsx              # Redirects to /admin/dashboard
+        │   └── dashboard|appointments|doctors|patients|
+        │       knowledge-base|reports|ai-receptionist|settings/
         └── components/
-            └── VoiceRecorder.jsx    # ★ Complete voice UI + WebSocket client
+            ├── AiReceptionistView.jsx # ★ Live voice UI: WS client, mic stream, playback
+            ├── AuthProvider.jsx       # Session state (login/logout/useAuth)
+            ├── AuthShell.jsx          # Shared login/signup layout
+            ├── micPcmStream.js        # startPcmStream(): mic → 16 kHz PCM16 chunks
+            ├── Sidebar.jsx            # Patient portal navigation
+            ├── DashboardView.jsx      # Portal dashboard
+            ├── BookAppointmentView.jsx # Booking flow
+            ├── MyAppointmentsView.jsx # Appointment history
+            ├── ProfileView.jsx        # Patient profile editor
+            ├── HospitalInfoView.jsx   # Static hospital information
+            ├── VoiceRecorder.jsx       # Legacy voice UI (superseded by AiReceptionistView)
+            └── admin/                 # Admin dashboard components (TSX)
+                ├── dashboard|appointments|doctors|patients|
+                │   knowledge-base|reports|settings/
+                └── ai-receptionist/
 ```
 
 ---
@@ -331,6 +394,52 @@ The `_id` compound key (`doctor_id:ISO_time`) enforces double-booking prevention
 
 ---
 
+### MongoDB — `doctors` collection
+
+```json
+{
+  "doctor_id": "doc-sarah-johnson",
+  "name": "Dr. Sarah Johnson",
+  "specialization": "General Physician",
+  "qualification": "MBBS, MD - General Medicine",
+  "experience": 12,
+  "available": true,
+  "created_at": "2026-10-08T12:00:00+00:00"
+}
+```
+
+Seeded via `python scripts/seed_doctors.py`. The voice appointment agent uses this directory to match caller requests to doctors.
+
+---
+
+### MongoDB — `conversations` + `conversation_messages`
+
+Every WebSocket voice session creates a conversation record and persists each turn:
+
+```json
+// conversations
+{
+  "_id": "uuid4-string",
+  "user_id": "ObjectId-string",
+  "status": "active | completed",
+  "started_at": "ISODate",
+  "ended_at": null
+}
+
+// conversation_messages
+{
+  "conversation_id": "uuid4-string",
+  "user_id": "ObjectId-string",
+  "role": "user | assistant",
+  "content": "…",
+  "timestamp": "ISODate"
+}
+```
+
+Indexes: `conversations.user_id`, `conversation_messages(conversation_id, timestamp)`, `conversation_messages.user_id`.
+
+---
+
 ### Redis — Session Store
 
 ```
@@ -383,34 +492,41 @@ Distance metric: **Cosine similarity**. Chunks are produced by `RecursiveCharact
 | `AppointmentCreate` | `POST /api/appointments` | `doctor_id`, `service`, `appointment_start`, `reason?` |
 | `RescheduleRequest` | `PATCH /appointments/{id}/reschedule` | `new_start` |
 | `CustomerProfileUpdate` | `PUT /api/customers/me` | `phone?`, `address?`, `date_of_birth?`, `emergency_contact?` |
+| `DoctorCreate` | `POST /api/doctors` | `name`, `specialization`, `experience?`, `available` |
 
 ---
 
 ## 6. Features and Workflows
 
-### 🎤 Real-Time Voice Conversation
+### 🎤 Real-Time Multilingual Voice Conversation
 
 ```
-Browser mic → 250ms PCM chunks → WebSocket /api/voice
-    └── mic_to_stt task ──────────────────────────────→ Deepgram Flux STT WebSocket
-                                                              │
-                                                    TurnInfo events
-                                                    (transcript + event type)
-    └── stt_to_queue task ← ──────────────────────────────────┘
-           │  EndOfTurn detected → push transcript to asyncio.Queue
-           │  StartOfTurn/EagerEndOfTurn during AI speech → BARGE-IN
+Browser mic → AudioWorklet (pcm-downsampler) → 16 kHz mono PCM16 frames
+    → WebSocket /api/voice?lang=en-IN   (session cookie required)
+        │
+    └── mic_to_stt task ──────────────────────────→ Sarvam STT (saaras:v4, wss)
+                                                          │
+                                        transcripts + VAD START/END speech events
+    └── stt_to_queue task ← ──────────────────────────────┘
+           │  transcript event → push (transcript, language) to asyncio.Queue
+           │  START_SPEECH (or transcript while AI talks) → BARGE-IN
            │       └── cancel current_turn_task + send {"type":"interrupt"} to browser
            │
     └── turn_worker task
            │  1. send {"type":"ai_thinking"}
-           │  2. generate_response(transcript, business_id)
+           │  2. if appointment intent → appointment_agent (LLM tool-calling state machine)
+           │     else → generate_response(transcript, business_id)
            │       └── RAG: embed question → Qdrant search → inject top-5 chunks
            │       └── Groq: system prompt + RAG context + transcript → AI text
-           │  3. send {"type":"ai_response", "response":"..."}
-           │  4. StreamingSpeech.speak(answer) → forward PCM chunks to browser
-           │  5. Wait for audio settle time + 400ms
-           │  6. send {"type":"ai_done"}
+           │  3. persist turn → MongoDB conversation_messages
+           │  4. send {"type":"ai_response", "response":"..."}
+           │  5. StreamingSpeech.speak(answer) → sentence-split Sarvam TTS (bulbul:v3)
+           │       → forward 24 kHz PCM chunks to browser
+           │  6. Wait for audio settle time + 400 ms
+           │  7. send {"type":"ai_done"}
 ```
+
+**Language selection:** the UI exposes a language picker persisted in `localStorage`; the chosen code is sent as `?lang=` (e.g. `hi-IN`). The same language drives STT, the LLM reply (via prompt hinting), and the TTS voice. Supported: `en-IN`, `hi-IN`, `bn-IN`, `ta-IN`, `te-IN`, `kn-IN`, `ml-IN`, `mr-IN`, `gu-IN`, `pa-IN`, `od-IN`.
 
 ### 📄 Document Indexing (RAG Setup)
 
@@ -430,10 +546,24 @@ Login:     POST /api/auth/login → bcrypt verify → secrets.token_urlsafe(32) 
            → Set-Cookie: session_id=<token>; HttpOnly; SameSite=lax
 Protected: middleware extracts session_id (cookie > Bearer > X-Session-ID header)
            → Redis get → deserialize → AuthenticatedUser context
+Voice WS:  cookie read before accept → Redis session lookup
+           → missing/invalid session closes the socket with code 1008
 Logout:    POST /api/auth/logout → Redis delete session → clear cookie
 ```
 
 ### 📅 Appointment Booking Flow
+
+**Voice path** — `services/appointment_agent.py` drives a stage machine:
+
+```
+collecting_details → ready_for_availability → awaiting_doctor_selection
+    → awaiting_time_selection → awaiting_confirmation
+    (plus awaiting_cancel_* / awaiting_reschedule_* branches)
+```
+
+The agent uses LLM tool calls (`find_doctors`, `check_doctor_availability`) and calls the same create/cancel/reschedule records as the REST API.
+
+**REST path:**
 
 ```
 1. GET /api/appointments/availability?doctor_id=DOC001&appointment_date=2026-10-10
@@ -468,7 +598,7 @@ Logout:    POST /api/auth/logout → Redis delete session → clear cookie
 - MongoDB (local or Atlas)
 - Redis (local or managed — falls back to in-memory FakeRedis if unavailable)
 - Qdrant (local Docker or Qdrant Cloud)
-- API keys: Deepgram, Groq, Google Gemini
+- API keys: **Sarvam AI**, **Groq**, **Google Gemini**, **Qdrant**
 
 ---
 
@@ -485,6 +615,7 @@ python -m venv venv
 
 # 3. Install dependencies
 pip install -r requirements.txt
+pip install sarvamai                # Sarvam STT/TTS SDK (voice pipeline)
 
 # 4. Configure environment
 copy .env.example .env
@@ -493,11 +624,14 @@ copy .env.example .env
 # 5. Create first admin account
 python scripts/create_admin.py --name "Hospital Admin" --email "admin@hospital.com" --password "Admin@123"
 
-# 6. Start the backend
+# 6. (Optional) Seed the doctors directory
+python scripts/seed_doctors.py
+
+# 7. Start the backend
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-API docs available at: `http://localhost:8000/docs`
+API docs available at: `http://localhost:8000/docs` · Health check: `http://localhost:8000/health`
 
 ---
 
@@ -514,7 +648,7 @@ npm install
 npm run dev
 ```
 
-Frontend available at: `http://localhost:3000`
+Frontend available at: `http://localhost:3000` (patient portal at `/`, admin at `/admin`)
 
 ---
 
@@ -534,8 +668,11 @@ SESSION_COOKIE_NAME=session_id
 SESSION_COOKIE_SECURE=False         # Set True in production (requires HTTPS)
 SESSION_COOKIE_SAMESITE=lax
 
-# ── Deepgram (STT + TTS) ─────────────────────────────────
-DEEPGRAM_API_KEY=your_deepgram_api_key
+# ── Sarvam AI (STT + TTS) ───────────────────────────────
+SARVAM_API_KEY=your_sarvam_api_key
+SARVAM_STT_MODEL=saaras:v4          # Streaming speech-to-text model
+SARVAM_TTS_MODEL=bulbul:v3          # Text-to-speech model
+SARVAM_TTS_SPEAKER=shubh            # Voice
 
 # ── Groq (LLM) ───────────────────────────────────────────
 GROQ_API_KEY=your_groq_api_key
@@ -551,17 +688,23 @@ QDRANT_COLLECTION_NAME=business_documents
 
 # ── RAG ──────────────────────────────────────────────────
 RAG_DEFAULT_BUSINESS_ID=your-hospital-id    # Used by voice sessions to scope Qdrant search
+
+# ── Legacy (still read by config.py, unused by the voice pipeline) ──
+DEEPGRAM_API_KEY=
 ```
 
 > **Note:** `QDRANT_URL` and `QDRANT_API_KEY` are required at startup — the server will refuse to start if they are missing.
 
 ### Optional Frontend Environment
 
-Create `frontend/.env.local` to override the default WebSocket URL:
+Create `frontend/.env.local` to override defaults:
 
 ```env
-# Override the backend WebSocket URL (defaults to ws://<hostname>:8000/api/voice)
-NEXT_PUBLIC_VOICE_WS_URL=wss://your-production-domain.com/api/voice
+# REST API base (defaults to http://<hostname>:8000)
+NEXT_PUBLIC_API_URL=http://localhost:8000
+
+# Voice WebSocket URL (defaults to ws://<hostname>:8000/api/voice)
+NEXT_PUBLIC_VOICE_WS_URL=ws://localhost:8000/api/voice
 ```
 
 ---
@@ -573,6 +716,7 @@ NEXT_PUBLIC_VOICE_WS_URL=wss://your-production-domain.com/api/voice
 ```powershell
 # Install production dependencies
 pip install -r requirements.txt
+pip install sarvamai
 
 # Run with Uvicorn (production: no --reload, multiple workers)
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
@@ -615,7 +759,7 @@ npm start
 
 **Production checklist:**
 
-- [ ] Set `NEXT_PUBLIC_VOICE_WS_URL=wss://your-backend-domain.com/api/voice` in `.env.production`
+- [ ] Set `NEXT_PUBLIC_API_URL` and `NEXT_PUBLIC_VOICE_WS_URL=wss://your-backend-domain.com/api/voice` in `.env.production`
 - [ ] Deploy to Vercel, Netlify, or a Node.js server
 - [ ] Ensure the backend CORS origin matches the frontend domain
 
@@ -629,7 +773,7 @@ npm start
 FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && pip install sarvamai
 COPY . .
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
 ```
@@ -654,13 +798,21 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", 
 | GET | `/api/admin/test` | Admin | Verify admin RBAC access |
 | POST | `/api/admin/create-admin` | Admin | Create a new admin account |
 
-### Voice — `/api/voice`
+### Voice & Chat — `/api`
 
 | Method | Endpoint | Auth | Description |
 |---|---|---|---|
-| WS | `/api/voice` | None | Real-time voice session (WebSocket) |
-| POST | `/api/chat` | None | Text-based chat (REST fallback) |
+| WS | `/api/voice?lang=en-IN` | Session cookie | Real-time voice session (closes `1008` without a valid session) |
+| POST | `/api/chat` | None | Text chat — body `{ "transcript": "..." }` → `{ "response": "..." }` |
 | POST | `/api/tts` | None | Text → WAV audio (REST) |
+
+### Doctors — `/api/doctors`
+
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/api/doctors` | — | Create a doctor (201) |
+| GET | `/api/doctors` | — | List doctors |
+| GET | `/api/doctors/{doctor_id}` | — | Fetch a single doctor |
 
 ### Appointments — `/api/appointments`
 
@@ -699,17 +851,17 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", 
 
 | `type` | Payload | Meaning |
 |---|---|---|
-| `transcript` | `transcript`, `is_final` | User's live or final transcript |
-| `ai_thinking` | — | Transcript sent to Groq, awaiting response |
-| `ai_response` | `response` | AI's text response |
+| `transcript` | `transcript`, `is_final`, `language` | User's final transcript |
+| `ai_thinking` | — | Transcript sent to the LLM, awaiting response |
+| `ai_response` | `response`, `language` | AI's text response |
 | `ai_done` | — | TTS audio fully delivered |
 | `interrupt` | — | Stop all queued audio (barge-in) |
-| `fallback` | `message` | Degraded response (e.g. RAG not configured) |
+| `fallback` | `message` | Degraded response (e.g. turn processing error) |
 | `error` | `message` | Fatal session error |
 
-**Server → Browser (Binary):** Raw linear16 PCM audio @ 24kHz (stream it directly to Web AudioContext)
+**Server → Browser (Binary):** Raw linear16 PCM audio @ 24 kHz (stream it directly to the Web Audio playback scheduler)
 
-**Browser → Server (Binary):** Raw audio chunks from `MediaRecorder` (250ms intervals)
+**Browser → Server (Binary):** Raw 16 kHz mono PCM16 frames from the `pcm-downsampler` AudioWorklet (3200-byte / 100 ms frames)
 
 ---
 
@@ -723,27 +875,29 @@ CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", 
 # Start with hot reload
 uvicorn main:app --reload
 
-# Run the full auth test suite
+# Run test scripts
 cd backend
 python Test/test_auth.py
-
-# Run individual test files
 python Test/test_db.py
 python Test/test_embeddings.py
 python Test/test_qdrant_connection.py
 python Test/test_rag_chat.py
+python Test/test_appointment_agent.py
+python Test/test_doctor_lookup.py
+python Test/test_sarvam.py           # Sarvam STT/TTS connectivity
 
 # Create an admin account
 python scripts/create_admin.py --name "Admin" --email "admin@example.com" --password "secure123"
-# Or interactively:
-python scripts/create_admin.py
+
+# Seed doctors
+python scripts/seed_doctors.py
 ```
 
 **Frontend:**
 
 ```bash
 npm run dev       # Start development server (http://localhost:3000)
-npm run build     # Production build
+npm run build     # Production build (webpack)
 npm start         # Serve production build
 npm run lint      # Run ESLint
 ```
@@ -779,6 +933,7 @@ async def admin_only(admin: AuthenticatedUser = Depends(require_admin)):
 |---|---|
 | `401 Unauthorized` | No session, invalid token, or expired Redis session |
 | `403 Forbidden` | Authenticated but role is insufficient |
+| `1008 (WS close)` | Voice WebSocket opened without a valid session cookie |
 
 ---
 
@@ -798,9 +953,10 @@ Set `RAG_DEFAULT_BUSINESS_ID=your-hospital-id` in `.env` so voice sessions use t
 
 ### Pre-Production Considerations
 
-- **Doctor scheduling:** The current slot system uses a fixed 09:00–17:00 grid. Integrate real doctor calendars and service-specific durations before going live.
-- **Appointment transactions:** For high-concurrency scenarios, use MongoDB multi-document transactions across `appointments` and `booking_slots`.
-- **Document auth:** The `/api/documents/*` endpoints currently have no authentication — restrict them in production to admin-only access.
-- **Cancellation policy:** Add time-based rules for how close to the appointment time cancellation is allowed.
-- **Notifications:** Add email/SMS confirmation for bookings, cancellations, and reminders.
-- **CORS:** Restrict `allow_origins` in `main.py` to your specific production domain.
+- **Requirements hygiene:** remove the legacy `deepgram-sdk` / `faster-whisper` / `chromadb` entries from `requirements.txt` and pin `sarvamai` once the migration is final.
+- **Doctor scheduling:** the current slot system uses a fixed 09:00–17:00 grid. Integrate real doctor calendars and service-specific durations before going live.
+- **Appointment transactions:** for high-concurrency scenarios, use MongoDB multi-document transactions across `appointments` and `booking_slots`.
+- **Document auth:** the `/api/documents/*` endpoints currently have no authentication — restrict them in production to admin-only access.
+- **Cancellation policy:** add time-based rules for how close to the appointment time cancellation is allowed.
+- **Notifications:** add email/SMS confirmation for bookings, cancellations, and reminders.
+- **CORS:** restrict `allow_origins` in `main.py` to your specific production domain.
